@@ -175,9 +175,9 @@ teardown() {
     done
     [ "$found" = true ] || return 1
 
-    run grep -F 'keytap encrypt keytap >' "$REPO_ROOT/scripts/import-cloudflare-api-token.sh" "$REPO_ROOT/scripts/cloudflare-setup.sh"
+    run grep -F 'keytap encrypt keytap >' "$REPO_ROOT/scripts/store-cloudflare-api-token.sh" "$REPO_ROOT/scripts/cloudflare-setup.sh"
     [ "$status" -eq 0 ] || return 1
-    run grep -E 'keytap[[:space:]]+encrypt.*(--to|-R)' "$REPO_ROOT/scripts/import-cloudflare-api-token.sh" "$REPO_ROOT/scripts/cloudflare-setup.sh"
+    run grep -E 'keytap[[:space:]]+encrypt.*(--to|-R)' "$REPO_ROOT/scripts/store-cloudflare-api-token.sh" "$REPO_ROOT/scripts/cloudflare-setup.sh"
     [ "$status" -eq 1 ]
 }
 

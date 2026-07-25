@@ -101,8 +101,15 @@ Cloudflare setup is separate and idempotent. It owns one locally managed
 Tunnel, one proxied CNAME for `gremvm.eviljuliette.com`, and one Access
 application whose allow policy contains exactly one email address.
 
+Create a dedicated, least-privilege Cloudflare **user API token** first; the
+exact permission and scope table is in [the remote-access guide](docs/REMOTE_ACCESS.md#cloudflare-api-token).
+Do not reuse the token used by another project or a Global API Key. Store the
+new value by pasting it into the hidden terminal prompt below. The value is
+never an argument, environment variable, or plaintext repository file.
+
 ```sh
 cd /Users/julsh/git/gremvm
+nix develop path:. -c ./scripts/store-cloudflare-api-token.sh
 export GREMVM_CLOUDFLARE_ACCESS_EMAIL='you@example.com'
 
 nix develop path:. -c ./scripts/cloudflare-setup.sh check
@@ -167,6 +174,11 @@ The Cloudflare API token is stored as
 has exactly one recipient: the Keytap-derived `keytap` identity. No ClipKitty
 recipient is used. The tunnel connector necessarily has one mode-0600
 plaintext operational copy outside the repository.
+
+`store-cloudflare-api-token.sh` is intentionally interactive. It receives the
+dedicated GremVM token only through the terminal and immediately seals it to
+that single identity; it has no dependency on a generic secret in another
+repository.
 
 Tart is already signed and notarized upstream; `cloudflared` is a pinned local
 CLI dependency. Importing Developer ID, App Store Connect, or notarization

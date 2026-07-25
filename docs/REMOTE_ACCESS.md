@@ -23,6 +23,38 @@ Cloudflare documents this flow in
 
 ## Provision Cloudflare
 
+### Cloudflare API token
+
+Create a **user API token** in Cloudflare Dashboard: **My Profile** → **API
+Tokens** → **Create Token** → **Create Custom Token**. Use a name such as
+`gremvm-provisioner`, and grant exactly the following permissions:
+
+| Scope | Permission | Resource selection |
+| --- | --- | --- |
+| Zone | Zone / Read | Include the specific `eviljuliette.com` zone |
+| Zone | DNS / Edit | Include the specific `eviljuliette.com` zone |
+| Account | Cloudflare Tunnel / Edit | Include the account that owns `eviljuliette.com` |
+| Account | Access: Apps and Policies / Edit | Include the account that owns `eviljuliette.com` |
+
+Cloudflare sometimes calls the `Edit` operations `Write` in API responses;
+select `Edit` in the Dashboard. Do not use a Global API Key, an all-accounts
+scope, an all-zones scope, or a token shared with another project. Set an
+expiration you will rotate (one year is a practical default); add an IP filter
+only if the administrative egress address is stable.
+
+Cloudflare shows the value once. Do not paste it into chat or a shell command.
+At the GremVM checkout, use the hidden prompt to create the one-recipient
+Keytap envelope:
+
+```sh
+cd /Users/julsh/git/gremvm
+nix develop path:. -c ./scripts/store-cloudflare-api-token.sh
+```
+
+The token is used only by `cloudflare-setup.sh` during reconciliation. It is
+not copied to the Mac Studio service; that service receives only the
+single-Tunnel connector credential created by `apply`.
+
 Run this on a trusted machine with the repository and the Keytap identity:
 
 ```sh
@@ -38,13 +70,6 @@ hostname record, Access application, and exclusive email policy before any
 mutation. `apply` creates only missing managed resources and is safe to rerun.
 It refuses conflicting or partially owned resources instead of overwriting or
 deleting them.
-
-The API token needs:
-
-- Zone / Zone / Read for `eviljuliette.com`;
-- Zone / DNS / Write for `eviljuliette.com`;
-- Account / Cloudflare Tunnel / Write; and
-- Account / Access: Apps and Policies / Write.
 
 The resulting resources are:
 
