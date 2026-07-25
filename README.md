@@ -1,193 +1,86 @@
 # GremVM
 
-GremVM is a small deployment layer around upstream
-[Tart](https://tart.run/), not a VM engine. Tart owns Virtualization.framework
-and the persistent macOS VM. This repository pins Tart 2.34.0 and
-`cloudflared` 2026.5.2, adds host lifecycle wiring, creates stopped `.tvm`
-exports, and routes ordinary SSH through Cloudflare.
+GremVM is now a small deployment layer around upstream [Lume](https://cua.ai/docs/how-to-guides/lume/install-lume), not a home-grown hypervisor. Lume owns the macOS VM, Recovery environment, Virtualization.framework integration, and SIP policy. This repository pins and verifies one notarized Lume release, supplies login-time lifecycle wiring, and makes stopped backups.
 
-At first creation, `--from-ipsw=latest` asks Apple for the newest macOS restore
-image supported by that Mac. GremVM will not select an older release to make
-SIP automation work. The VM is persistent: rerunning setup neither recreates it
-nor silently changes its macOS version. Apply later macOS updates inside the
-guest.
+The selected release is Lume 0.4.0. Its archive checksum, Cua signing team, bundle identifier, and source commit are fixed in [`versions/lume.env`](versions/lume.env). Upgrades are deliberate version/hash reviews; neither Lume's floating installer nor its self-updater is used.
 
-## Important host boundary
+## Why Lume
 
-The service starts after the owning host account logs in. macOS 15 and newer
-require an unlocked `login.keychain` for Virtualization.framework. Tart offers
-headless workarounds that either store/unlock a password or create an
-empty-password login keychain; this minimal deployment deliberately does
-neither. Consequently, it does **not** satisfy pre-login recovery after a cold
-boot. Someone must unlock FileVault when enabled and log in locally; locking
-the host screen afterward is fine.
+Lume is the only compared option with a first-class, verified SIP workflow:
 
-GremVM never reads or changes FileVault or automatic-login settings. Tart's
-empty-keychain workaround is explicitly not a stable contract, and
-[fresh-host failures](https://github.com/openai/tart/issues/1146) show that a
-one-time GUI login may create additional state that the documented keychain
-commands do not. A dedicated service-account LaunchDaemon would therefore be
-an experimental, host-qualified deployment rather than a reliable fix; it is
-intentionally outside this small wrapper.
+```sh
+lume sip off work --yes
+```
 
-Other boundaries:
+It boots the VM's paired Recovery environment, runs `csrutil disable`, boots normally, verifies the canonical result, and leaves the VM stopped. Tart can boot Recovery, but disabling SIP there is still a manual console procedure. The full comparison and the requirements that necessarily changed are in [`docs/DECISION.md`](docs/DECISION.md).
 
-- Apple silicon is required.
-- The LaunchAgent restarts a failed Tart runner. It is not a guest-health
-  monitor and cannot recover every guest hang.
-- macOS installation, Setup Assistant, and the guest bootstrap are one-time
-  interactive steps.
-- SIP is optional manual maintenance. It is not part of VM readiness and is
-  never reported as disabled without an in-guest check.
-- On macOS 15+, `cloudflared` may need one-time Local Network approval to reach
-  Tart's private guest address. GremVM does not change that privacy setting.
+## Honest host-start boundary
+
+This replacement does **not** claim the old pre-login guarantee. On current macOS, Virtualization.framework VM startup depends on an unlocked user login keychain, and Tart documents the same underlying headless limitation. Lume has no built-in VM-autostart service (its optional LaunchAgent is for the unused API daemon), so GremVM supplies a user LaunchAgent that starts the VM after its owning host account logs in.
+
+- Host FileVault is never read or changed.
+- Host automatic login is never read or changed.
+- With FileVault enabled, someone must unlock the Mac and log in after a cold boot.
+- With FileVault disabled but no host login, the VM stays stopped.
+- Locking the host screen is fine; logging the owning account out stops its LaunchAgent.
+
+That trade is what removes the bespoke root daemon, service keychain, custom Virtualization.framework code, signing pipeline, and Apple developer secrets.
 
 ## Install and provision
 
-Requirements are an Apple-silicon Mac, Nix with flakes, at least 16 GiB host
-RAM recommended, and enough storage for the IPSW, VM, and backups.
+Requirements: Apple silicon, macOS 26 or newer, at least 16 GiB host RAM recommended, 150 GiB free logical VM capacity, Nix with flakes, an enabled macOS Application Firewall, and one local setup session. This deployment deliberately qualifies only a macOS 26 (Tahoe) guest because that is Lume 0.4.0's currently verified unattended Recovery/SIP workflow. On a macOS 26 host, `GREMVM_IPSW=latest` selects Tahoe; on a newer host, configure an absolute path to a reviewed Tahoe IPSW before provisioning.
 
 ```sh
-cd /Users/julsh/git/gremvm
-nix run path:. -- install
-
+nix develop path:.
+./bin/gremvm install
 GREMVM="$HOME/Library/Application Support/GremVM/bin/gremvm"
 "$GREMVM" provision
 ```
 
-`install` copies the reviewed, upstream-signed Tart release, a Nix-pinned
-`cloudflared` executable, and a private user LaunchAgent. It does not compile a
-VM engine or require personal Apple signing credentials.
+`install` is idempotent. It downloads the exact Lume archive, verifies SHA-256, the complete code signature, Developer ID team `YCK386LBJ7`, bundle identifier `com.trycua.lume`, hardened-runtime flag, Gatekeeper acceptance, and reported version. It disables Lume telemetry before ordinary use, adds a deny-inbound Application Firewall rule for Lume, and installs a private user LaunchAgent. It never runs Lume's unauthenticated HTTP service. The optional `~/.local/bin/gremvm` symlink is created when that path is free; the absolute command above always works.
 
-On first `provision`, GremVM creates the persistent VM from
-`--from-ipsw=latest`, opens Tart's local console, and mounts a generated
-read-only bootstrap directory. Complete macOS installation and Setup Assistant
-with the dedicated work account (`grem` by default), then run the displayed
-bootstrap command in the guest and shut down from the Apple menu. Rerunning
-`provision` resumes an interrupted setup and refuses to adopt or overwrite an
-unrelated same-named Tart VM.
+`provision` creates a vanilla Tahoe VM using NAT networking and Lume's unattended setup; installs a host-key-pinned, shutdown-only SSH key; disables SIP through Recovery; verifies `csrutil status`; verifies clean guest shutdown; and starts the LaunchAgent. Its explicit phases (`creating`, `created`, `sip-disabled`, and `ready`) make reruns resume safely without treating a partial VM as complete. The default `GREMVM_IPSW=latest` is allowed only on a macOS 26 host. For a newer host or exact guest-build reproducibility, set it to an absolute, reviewed Tahoe IPSW in the generated config before provisioning; GremVM reads the IPSW's `ProductVersion` and rejects non-Tahoe images.
 
-The bootstrap enables macOS Remote Login, installs a forced-command SSH key
-that can only request clean shutdown, and disables guest sleep. It does not
-configure Cloudflare, change SIP, or alter host settings.
+Lume's unattended bootstrap temporarily creates the guest administrator `lume` with password `lume`, enables guest SSH and guest automatic login, and disables guest sleep/lock. These are **guest** changes, not host changes. Immediately after provisioning:
 
-## Operations
+```sh
+"$GREMVM" console
+```
+
+Change the guest password before adding work data or remote access. If future `gremvm sip-off` use matters, choose a long passphrase made from lowercase ASCII letters, digits, and hyphens; that is the character set Lume 0.4.0's Recovery automation accepts. Then follow [`docs/REMOTE_ACCESS.md`](docs/REMOTE_ACCESS.md).
+
+## Commands
 
 ```sh
 "$GREMVM" status
 "$GREMVM" start
 "$GREMVM" stop
 "$GREMVM" restart
-"$GREMVM" console
 "$GREMVM" logs --follow --lines 200
+"$GREMVM" console
+nix develop path:. -c "$GREMVM" sip-off
+"$GREMVM" firewall-check
 "$GREMVM" runtime-path
+"$GREMVM" acknowledge-hardening --confirm
 
-"$GREMVM" backup --destination "/Volumes/GremVM Backup/tart"
+"$GREMVM" backup --destination "/Volumes/GremVM Backup/lume"
 "$GREMVM" uninstall
 ```
 
-Managed runs use NAT networking, no graphics, no clipboard, and no persistent
-host-directory share. `console` is the local break-glass path. `stop`, host
-logout, and host shutdown request guest shutdown through the restricted key,
-then require Tart to release the VM. Backups refuse to export a running VM.
+The LaunchAgent uses a `PathState`-conditioned `KeepAlive` to restart the Lume runner after a process failure, but only after provisioning reaches `ready`. On logout or host shutdown, its small supervisor asks the guest to shut down through a forced-command SSH key, requires Remote Login to remain unavailable for repeated polls plus a disk-settle interval, then reaps the exact managed runner. This explicit reap is necessary because Lume 0.4.0's foreground process remains resident after a guest-initiated halt. If shutdown evidence cannot be established, logs say so and fall back to Lume stop. An interactive `stop` reports that fallback as an error. Backups never use the destructive fallback.
 
-`uninstall` removes the wrapper, LaunchAgent, Tart runtime, and `cloudflared`
-runtime. It preserves the VM, configuration, logs, lifecycle keys, Cloudflare
-tunnel credential, and backups. There is deliberately no purge command.
-
-## SSH through Cloudflare
-
-Cloudflare setup is separate and idempotent. It owns one locally managed
-Tunnel, one proxied CNAME for `gremvm.eviljuliette.com`, and one Access
-application whose allow policy contains exactly one email address.
-
-Create a dedicated, least-privilege Cloudflare **user API token** first; the
-exact permission and scope table is in [the remote-access guide](docs/REMOTE_ACCESS.md#cloudflare-api-token).
-Do not reuse the token used by another project or a Global API Key. Store the
-new value by pasting it into the hidden terminal prompt below. The value is
-never an argument, environment variable, or plaintext repository file.
-
-```sh
-cd /Users/julsh/git/gremvm
-nix develop path:. -c ./scripts/store-cloudflare-api-token.sh
-export GREMVM_CLOUDFLARE_ACCESS_EMAIL='you@example.com'
-
-nix develop path:. -c ./scripts/cloudflare-setup.sh check
-nix develop path:. -c ./scripts/cloudflare-setup.sh apply
-nix develop path:. -c ./scripts/cloudflare-install-host.sh
-"$GREMVM" restart
-```
-
-The setup token needs Zone Read, DNS Write, Cloudflare Tunnel Write, and
-Access: Apps and Policies Write. `check` is read-only and runs every inventory
-check before `apply` mutates anything. Runtime keeps only a tunnel-specific
-credential; the account API token is never installed into the host service.
-
-On the client, install `cloudflared` and add:
-
-```sshconfig
-Host gremvm
-  HostName gremvm.eviljuliette.com
-  User grem
-  ProxyCommand /absolute/path/cloudflared access ssh --hostname %h
-```
-
-Then use normal OpenSSH tools: `ssh gremvm`, `scp ... gremvm:...`, and
-`sftp gremvm`. This is SSH proxied over Cloudflare's WebSocket transport, not
-WebRTC. A basic Cloudflare Tunnel cannot expose raw public TCP port 22; removing
-the `ProxyCommand` requires WARP/private routing or Cloudflare Spectrum.
-
-Cloudflare Access authenticates the allowed identity first. The guest still
-performs normal SSH authentication with its macOS password or a public key you
-add to `~/.ssh/authorized_keys`. See [docs/REMOTE_ACCESS.md](docs/REMOTE_ACCESS.md)
-for host-key verification and acceptance tests.
+Ordinary uninstall removes the LaunchAgent, wrapper, and vendored Lume runtime. It preserves the VM store, configuration, shutdown key, logs, and every backup. There is deliberately no purge flag.
 
 ## Backups
 
-`backup` cleanly stops the VM and exports it with `tart export` to a timestamped
-`.tvm`. It validates the Apple Archive members, computes a SHA-256 digest, and
-writes a completion manifest last. A `.tvm` is compressed but not encrypted.
-Use an APFS (Encrypted) external disk for the first copy and optionally restic
-for encrypted off-site history. Retention and restore drills are in
-[docs/BACKUPS.md](docs/BACKUPS.md).
+`gremvm backup` requires an existing writable directory on a different mounted volume and a running managed supervisor. It holds a crash-recoverable lifecycle lock, sends the authenticated guest shutdown, requires sustained SSH disappearance plus the settle interval, terminates and reaps only the recorded managed Lume process, unloads the supervisor, makes a Lume clone containing `disk.img`, `nvram.bin`, and `config.json` together, writes a completion manifest last, and restarts the VM. No existing backup is pruned.
 
-## SIP
+Use an APFS (Encrypted) external volume for the first copy and restic for encrypted, deduplicated off-site history. The exact setup, retention policy, and restore drill are in [`docs/BACKUPS.md`](docs/BACKUPS.md).
 
-If SIP still matters, make a verified stopped export first, stop the managed
-service, and use Tart Recovery manually with the managed `TART_HOME`:
-
-```sh
-TART="$("$GREMVM" runtime-path)"
-TART_HOME="$HOME/Library/Application Support/GremVM/tart" \
-  "$TART" run --recovery work
-```
-
-In Recovery Terminal run `csrutil disable`, then boot normally and check
-`csrutil status` inside the guest. This may stop working as Apple changes the
-latest release; GremVM neither automates nor records the result.
-
-## Secrets, signing, and checks
-
-The Cloudflare API token is stored as
-`secrets/CLOUDFLARE_API_TOKEN.age`. `apply` creates
-`secrets/CLOUDFLARE_TUNNEL_CREDENTIALS.age`. Every active-tree age envelope
-has exactly one recipient: the Keytap-derived `keytap` identity. No ClipKitty
-recipient is used. The tunnel connector necessarily has one mode-0600
-plaintext operational copy outside the repository.
-
-`store-cloudflare-api-token.sh` is intentionally interactive. It receives the
-dedicated GremVM token only through the terminal and immediately seals it to
-that single identity; it has no dependency on a generic secret in another
-repository.
-
-Tart is already signed and notarized upstream; `cloudflared` is a pinned local
-CLI dependency. Importing Developer ID, App Store Connect, or notarization
-secrets would add unused sensitive material, so this deployment does not do it.
+## Development
 
 ```sh
 nix develop path:. -c ./scripts/check.sh
 ```
 
-Before relying on the Mac Studio remotely, test initial provisioning, guest
-shutdown, runner restart, cold boot with the actual FileVault setting, external
-SSH, stopped export, import under a new name, and a booted restore.
+Static checks cover shell formatting/linting, Nix formatting/evaluation, lifecycle-state smoke tests, the exact upstream pin, and absence of personal signing material. Provisioning, Recovery, firewall reachability, cold boot, and restore still require acceptance tests on the actual Mac Studio.

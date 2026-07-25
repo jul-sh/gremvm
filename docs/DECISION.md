@@ -1,135 +1,40 @@
-# Architecture decisions
+# VM engine decision: Lume over Tart and custom code
 
-Decision date: 2026-07-24. Reassess pins when Tart, `cloudflared`, or a new
-macOS release changes behavior relied on here.
+Decision date: 2026-07-24. Reassess this document when upgrading the pinned VM engine.
 
-## VM engine: Tart
-
-| Requirement | Custom Virtualization.framework service | Lume 0.4.0 | Tart 2.34.0 |
+| Requirement | Previous custom service | Lume 0.4.0 | Tart 2.34.0 |
 |---|---|---|---|
-| Maintained VM engine | This repository | Cua | OpenAI/Cirrus Labs |
-| Latest host-supported Apple IPSW | Custom code | Possible, but prior design constrained it for SIP | **First-class `--from-ipsw=latest`** |
-| Persistent local macOS VM | Yes | Yes | Yes |
-| New macOS release setup | Custom maintenance | Unattended flow needs qualification | Manual Setup Assistant; least release-specific |
-| SIP disable | Custom work | Automated only on qualified Recovery flow | Manual Recovery; not guaranteed |
-| Portable stopped backup | Custom format | Directory clone | **Compressed `.tvm` export/import** |
-| Pre-login start on macOS 15+ | Custom keychain work | Needs keychain workaround | Needs keychain workaround |
-| Signing responsibility | Personal signing/notary | Upstream | Upstream |
-| Local code | Large service | Lifecycle policy | Small lifecycle/export wrapper |
+| Maintained VM engine | This repository | Cua upstream | OpenAI upstream |
+| Persistent macOS VM | Yes | Yes | Yes |
+| Automated SIP disable | Not implemented | **Yes: `lume sip off`** | No; manual Recovery console |
+| Paired disk/NVRAM clone | Custom bundle backup | `lume clone` | `tart clone`/export |
+| Headless foreground run | Yes | `lume run --no-display` | `tart run --no-graphics` |
+| Built-in VM autostart | Custom system daemon | No | No |
+| Supported start before login | Intended, hardware qualification pending | No | No on modern macOS |
+| Guest-clean `stop` | Custom guest agent | No native command; GremVM requests guest shutdown, then reaps Lume | No; destructive VZ stop |
+| Ongoing local code | About 13,000 lines of Swift/tests | Small shell policy layer | Small shell policy layer plus manual SIP |
+| Signing responsibility | User Developer ID/notary | Upstream notarized app | Upstream notarized app |
 
-Use pinned Tart 2.34.0. The newest host-supported macOS guest is more important
-than automating SIP disablement. Tart passes `latest` to Apple's supported
-restore-image lookup, and its
-[Quick Start](https://tart.run/quick-start/) documents the manual installation
-flow.
+## Decision
 
-Manual Setup Assistant is intentional. It avoids release-specific UI
-automation and does not reject a new macOS solely because an older Recovery
-workflow was the last qualified one. `latest` resolves only at initial
-creation; the persistent VM is not recreated on reruns.
+Use pinned Lume. Its maintained Recovery automation is decisive because SIP must be disabled in the guest. Lume explains that SIP is signed LocalPolicy paired with `disk.img`, `nvram.bin`, and virtual hardware identity; its workflow changes that policy in paired Recovery and verifies it after reboot. Lume 0.4.0 currently qualifies Tahoe for this Recovery workflow, so this deployment rejects older guests and requires an explicitly reviewed Tahoe IPSW when the host is newer than macOS 26. See [Lume's SIP guide](https://cua.ai/docs/how-to-guides/lume/change-sip), [policy model](https://cua.ai/docs/concepts/how-sip-works-in-lume-vms), and [limits](https://cua.ai/docs/reference/lume/limits).
 
-Lume was previously attractive because `lume sip off` paired Recovery and
-verification on a known release. That conflicts with the final latest-first
-priority. Tart exposes Recovery through `tart run --recovery`; GremVM treats
-any SIP change as optional operator maintenance and never infers success.
+Tart 2.34.0 is the stronger choice for CI-style OCI image distribution and export/import, but it exposes only Recovery boot. The operator must drive `csrutil disable` manually. Tart also documents that macOS 15 and later require an unlocked `login.keychain` to start a VM on a headless host; its workarounds are a GUI/automatic login or a manually managed keychain. See [Tart's headless FAQ](https://tart.run/faq/#headless-machines) and [Quick Start](https://tart.run/quick-start/).
 
-Tart's `export` and `import` preserve configuration, disk, NVRAM, and hardware
-identity in an Apple Archive. This keeps the backup boundary upstream-owned.
+The previous native service could pursue pre-login startup with a root service keychain, authenticated guest agent, custom backup format, Developer ID signing, and ongoing Virtualization.framework compatibility work. It was not installed and no VM data exists in this checkout, so replacing it loses no live VM. Keeping that code would contradict the new goal of using a VM stack maintained elsewhere.
 
-## Host lifecycle boundary
+## Requirements deliberately relaxed
 
-Use one per-user Aqua LaunchAgent with `KeepAlive` tied to an explicit
-`WANTS-RUNNING` file. It starts Tart after login, restarts the runner after
-failure, and handles TERM by stopping the remote connector first and then
-requesting guest shutdown over a forced-command SSH key.
+Neither upstream tool provides all of the previous host-service contract. This deployment changes three claims instead of disguising custom infrastructure as an upstream solution:
 
-This deliberately does not meet the original pre-user-session requirement.
-Starting with macOS 15, Virtualization.framework needs an unlocked
-`login.keychain`. Tart documents two
-[headless workarounds](https://tart.run/faq/#headless-machines): store/unlock a
-login password, or create and select an empty-password login keychain. The
-first adds a boot-time host credential and the second can alter the owning
-user's keychain behavior. Tart describes the automated workaround as unstable,
-and [fresh-host failures](https://github.com/openai/tart/issues/1146) show that
-a one-time GUI login may create additional state. A dedicated service-account
-LaunchDaemon would isolate that workaround but would still be experimental and
-require cold-boot qualification on the target host. The implementation instead
-requires one host login after cold boot and never changes FileVault or
-automatic login.
+1. Startup is at the owning user's Aqua login, not at the login window. Host FileVault and automatic login remain untouched.
+2. `launchd` restarts a failed Lume process, but Lume's foreground loop does not reliably detect every guest kernel panic. Process failure recovery is supported; guest health recovery is not promised.
+3. Lume's own `stop` is not guest-clean, and its 0.4.0 foreground loop stays resident after a guest-initiated halt. The local policy layer uses a narrowly restricted, host-key-pinned SSH key to invoke `/sbin/shutdown -h now`, requires sustained SSH disappearance plus a settle interval, and then terminates the exact recorded runner. SSH disappearance is conservative operational evidence, not a Virtualization.framework state attestation; the strict alternative is to wait for an upstream Lume release whose runner exits on the guest-stopped event. This is the only lifecycle glue retained here.
 
-## Remote access: OpenSSH through Cloudflare Tunnel
+Apple documents that `VZVirtualMachine.stop` is destructive because it gives the guest no opportunity to shut down. That is why backups refuse to proceed unless the SSH shutdown was confirmed. See [Apple's stop API](https://developer.apple.com/documentation/virtualization/vzvirtualmachine/stop%28completionhandler%3A%29).
 
-Use the guest's existing macOS `sshd`, a locally managed Cloudflare Tunnel on
-the host, and native OpenSSH on the client with:
+## Supply-chain policy
 
-```sshconfig
-ProxyCommand /absolute/path/cloudflared access ssh --hostname %h
-```
+The repository downloads only the versioned Lume 0.4.0 arm64 archive from its [official release](https://github.com/trycua/cua/releases/tag/lume-v0.4.0). It requires the reviewed SHA-256 and verifies the complete app signature, Developer ID identity, hardened-runtime flag, Gatekeeper acceptance, and reported version. No floating Lume installer, `latest` release alias, self-update, ad-hoc rebuild, or re-signing is accepted. Apple's restore image remains a one-time dynamic input because Lume asks Virtualization.framework for the image supported by that host; the resulting persistent VM is not recreated on reruns.
 
-No custom network protocol or guest agent is maintained. There is no browser
-UI, VNC, WebRTC, TURN, signaling Worker, public port 22, or router forward.
-Cloudflare Access adds an identity allowlist before the normal guest SSH
-authentication.
-
-The host connector is smaller than a guest installation: the existing
-supervisor already knows when Tart starts, can resolve its current NAT address,
-and can terminate a sibling process before shutdown. Installing a connector in
-the guest would add another LaunchDaemon, binary-update path, and secret
-transfer to every restored VM.
-
-A local Tunnel configuration is used because the guest origin address is
-dynamic. The account API token is used only during setup; runtime receives a
-non-expiring credential scoped to running that one Tunnel. The supervisor
-atomically renders one ingress route to `ssh://<guest-ip>:22` plus a 404
-catch-all, validates it, and retries the pinned `cloudflared` process after
-failure.
-
-Cloudflare's basic published SSH flow transports SSH through WebSocket and
-requires client-side `cloudflared`. Truly raw TCP SSH needs WARP private routing
-or Spectrum and is not the default minimal design.
-
-## Deliberate limits
-
-1. A cold boot requires FileVault unlock when enabled and one login by the
-   owning user before the VM and Tunnel return.
-2. First provision requires local macOS installation and a generated guest
-   bootstrap. Interrupted creation can be resumed.
-3. `launchd` restarts a failed Tart process, not every guest hang. A stale
-   Virtualization.framework state may still require operator intervention.
-4. Shutdown evidence combines the forced-command acknowledgement with Tart
-   releasing the VM. If evidence is missing, backup refuses export.
-5. A changed guest SSH host key fails closed for the clean SSH shutdown path
-   and Tunnel exposure. Stop may then require Tart's destructive fallback, and
-   the mismatch requires local investigation.
-6. SIP Recovery may fail on a new release or change after an OS update. Back up
-   first and verify `csrutil status` inside normal macOS.
-7. A `.tvm` is compressed, not encrypted or self-retaining. Encryption,
-   retention, off-site copies, and restore tests remain separate operations.
-8. `ssh: configured` means only that the local tunnel credential exists; it is
-   not an end-to-end health check.
-
-## Supply chain, signing, and secret scope
-
-The deployment verifies and uses the versioned, upstream-signed Tart 2.34.0
-release. Tart self-update is not used. `cloudflared` 2026.5.2 comes from the
-locked Nixpkgs input and is copied as a local CLI runtime. The Apple IPSW is
-deliberately dynamic only when `latest` is resolved during first creation.
-
-There is no locally distributed application to Developer-ID sign or notarize.
-Importing the user's Developer ID certificate, App Store Connect API key, or
-notary secret would be unused and contrary to secret minimization.
-
-Keytap is the only age recipient for the active Cloudflare API-token and
-tunnel-credential envelopes. No ClipKitty recipient is present. The host must
-materialize one mode-0600 tunnel credential for unattended connector startup;
-the broader API token remains encrypted and is never installed in runtime.
-
-The local Git object database contains Codex checkpoint refs from superseded
-work, including historical two-recipient signing envelopes. They are not in the
-active tree and are not included by an ordinary branch push, but mirroring the
-entire `.git` directory would include them. Removing those refs is destructive
-history cleanup and is intentionally not done by installation or uninstall.
-
-Tart uses a Fair Source license; a personal workstation is covered by its free
-tier, while broader organizational use may require a subscription. Review
-[Tart licensing](https://tart.run/licensing/) before expanding deployment.
+Upstream Lume already carries the signature that macOS evaluates. The previous Apple certificate/notary envelopes and Keytap signing flow have therefore been removed from this repo. The original credentials remain owned by ClipKitty; they are not copied, decrypted, re-encrypted, or used here.

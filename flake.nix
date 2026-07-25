@@ -1,5 +1,5 @@
 {
-  description = "Pinned tooling for a Tart-managed persistent macOS VM";
+  description = "Pinned tooling for a Lume-managed persistent macOS VM";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-26.05-darwin";
@@ -16,6 +16,27 @@
       systems = [ "aarch64-darwin" ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
       pkgsFor = system: nixpkgs.legacyPackages.${system};
+      vncdotoolFor =
+        system:
+        let
+          pkgs = pkgsFor system;
+        in
+        pkgs.python3Packages.buildPythonApplication rec {
+          pname = "vncdotool";
+          version = "1.3.0";
+          pyproject = true;
+          src = pkgs.fetchPypi {
+            inherit pname version;
+            hash = "sha256-Y9ObPp0JdN96937Zcc8UE4M3GlqczFIyu3rSXDMpitY=";
+          };
+          build-system = [ pkgs.python3Packages.setuptools ];
+          dependencies = with pkgs.python3Packages; [
+            cryptography
+            pillow
+            twisted
+          ];
+          doCheck = false;
+        };
     in
     {
       packages = forAllSystems (
@@ -24,13 +45,13 @@
           pkgs = pkgsFor system;
         in
         {
+          vncdotool = vncdotoolFor system;
           restic = pkgs.restic;
           keytap = keytap.packages.${system}.default;
           default = pkgs.writeShellApplication {
             name = "gremvm";
             runtimeInputs = [ ];
             text = ''
-              export GREMVM_BUNDLED_CLOUDFLARED=${pkgs.cloudflared}/bin/cloudflared
               exec ${self}/bin/gremvm "$@"
             '';
           };
@@ -46,14 +67,11 @@
           default = pkgs.mkShellNoCC {
             packages = [
               pkgs.bats
-              pkgs.cloudflared
-              pkgs.curl
-              pkgs.jq
               pkgs.nixfmt
-              pkgs.openssl
               pkgs.restic
               pkgs.shellcheck
               pkgs.shfmt
+              (vncdotoolFor system)
               keytap.packages.${system}.default
             ];
           };
@@ -74,7 +92,6 @@
                 src = self;
                 nativeBuildInputs = [
                   pkgs.bats
-                  pkgs.jq
                   pkgs.nixfmt
                   pkgs.shellcheck
                   pkgs.shfmt
@@ -88,7 +105,6 @@
                 shfmt -d -i 4 -ci -sr bin/gremvm scripts tests
                 nixfmt --check flake.nix
                 bats tests
-                sh tests/smoke.sh
                 touch "$out"
               '';
         }

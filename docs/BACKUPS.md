@@ -1,89 +1,69 @@
 # Backups and recovery
 
-The supported backup unit is a **stopped Tart `.tvm` export**. Never copy Tart's live `disk.img` or export a running VM. A complete export keeps the VM configuration, disk, NVRAM, and Apple-silicon hardware identity together.
+The supported backup unit is a **stopped complete Lume VM**, never a live `disk.img`. A SIP-disabled Apple-silicon VM depends on the disk, NVRAM, and virtual hardware identity staying coherent. Lume's clone operation copies that paired state together.
 
-Set the installed paths once:
+Examples use the canonical installed command path:
 
 ```sh
 GREMVM="$HOME/Library/Application Support/GremVM/bin/gremvm"
-TART="$("$GREMVM" runtime-path)"
-TART_HOME="$HOME/Library/Application Support/GremVM/tart"
+LUME="$("$GREMVM" runtime-path)"
 ```
 
-## Recommended layout
+## Recommended 3-2-1 layout
 
-Keep three copies on two kinds of storage, with one copy off-site:
+1. Live VM in `~/Library/Application Support/GremVM/vms/work`.
+2. Bootable stopped clones on a separately mounted APFS (Encrypted) external disk.
+3. Encrypted, deduplicated restic snapshots in a second physical or off-site repository.
 
-1. the live Tart VM on the Mac Studio;
-2. at least two stopped `.tvm` generations on a separately mounted APFS (Encrypted) SSD; and
-3. an encrypted off-site copy, such as restic object storage.
+An external Lume clone is immediately useful for recovery, but it has no independent integrity catalog, retention engine, or off-site protection. Restic supplies those layers. Time Machine may back up a stopped clone, but do not rely on a Time Machine copy of the live VM image.
 
-A `.tvm` is LZFSE-compressed Apple Archive data. It is **not encrypted**. Protect the external disk passphrase outside the guest, and do not put a sensitive export on an unencrypted volume.
+## Prepare the first backup volume
 
-## Create a stopped export
-
-Prepare the destination explicitly so a missing external disk cannot be mistaken for a host directory:
+In Disk Utility, format a dedicated external SSD as APFS (Encrypted). Losing its passphrase loses this copy, so keep recovery material outside the guest. Mount it and create the repository as the host user that owns the VM:
 
 ```sh
-mkdir -m 700 "/Volumes/GremVM Backup/tart"
-"$GREMVM" backup --destination "/Volumes/GremVM Backup/tart"
+mkdir -m 700 "/Volumes/GremVM Backup/lume"
 ```
 
-The backup operation serializes lifecycle changes, sends the restricted guest shutdown request when the managed VM is running, and requires the Tart runner to release the VM and report it stopped before invoking `tart export`. It then:
+GremVM deliberately refuses to create missing `/Volumes` paths. If the disk is absent, this prevents a large unencrypted backup from silently landing on the host startup disk. It also refuses a same-filesystem destination because an APFS clone on the live disk is only a checkpoint, not disaster recovery.
 
-1. writes a timestamped `.tvm` to a temporary path;
-2. asks `/usr/bin/aa` to enumerate the Apple Archive;
-3. requires archive entries for `config.json`, `disk.img`, and `nvram.bin`;
-4. computes a SHA-256 digest;
-5. moves the completed export into place; and
-6. writes an adjacent JSON completion manifest last.
-
-The command prints the final export and manifest paths. A `.tvm` without its completion manifest is incomplete or unmanaged and must not be selected automatically. The source VM is never deleted, and completed older exports are never pruned by GremVM.
-
-`aa list` proves that Apple Archive can parse the container and enumerate the expected VM members. The recorded SHA-256 detects later changes to that exact file. Neither proves that macOS and the work data are usable; only an import and booted restore drill does that.
-
-You can repeat the structural check without extracting the archive:
+## Create a bootable clone
 
 ```sh
-EXPORT='/Volumes/GremVM Backup/tart/work--20260724T210000Z.tvm'
-/usr/bin/aa list -i "$EXPORT" -list-format json >/dev/null
-/usr/bin/shasum -a 256 "$EXPORT"
+"$GREMVM" backup --destination "/Volumes/GremVM Backup/lume"
 ```
 
-Verify the filename, size, and digest against the adjacent completion manifest. Do not edit either file after creation:
+The command requires the GremVM supervisor to be loaded and the VM to have reached `state: running`. This restriction excludes raw/unmanaged Lume processes, whose exit cannot be proven safely. If the VM is stopped, run `"$GREMVM" start`, wait for `state: running`, and retry. The command then:
 
-```sh
-MANIFEST="$EXPORT.manifest.json"
-EXPECTED_NAME=$(/usr/bin/plutil -extract archive raw -o - "$MANIFEST")
-EXPECTED_BYTES=$(/usr/bin/plutil -extract archiveBytes raw -o - "$MANIFEST")
-EXPECTED_SHA=$(/usr/bin/plutil -extract archiveSha256 raw -o - "$MANIFEST")
-ACTUAL_BYTES=$(/usr/bin/stat -f %z "$EXPORT")
-ACTUAL_SHA=$(/usr/bin/shasum -a 256 "$EXPORT" | /usr/bin/awk '{print $1}')
+1. requests `/sbin/shutdown -h now` through a shutdown-only SSH key;
+2. requires Remote Login to remain unavailable for repeated polls, then waits an additional disk-settle interval;
+3. terminates and reaps the exact runner identity recorded by the supervisor, then unloads that supervisor while a crash-recoverable lifecycle lock prevents restart;
+4. asks Lume to clone disk, NVRAM, and configuration to a timestamped name;
+5. verifies Lume can read the clone and that all three required files exist;
+6. writes `gremvm-backup.json`; and
+7. restarts only if it was running beforehand.
 
-[ "$(basename "$EXPORT")" = "$EXPECTED_NAME" ]
-[ "$ACTUAL_BYTES" = "$EXPECTED_BYTES" ]
-[ "$ACTUAL_SHA" = "$EXPECTED_SHA" ]
-```
+Lume 0.4.0 does not exit its foreground loop when macOS halts, so runner exit alone cannot prove shutdown. This protocol first authenticates the shutdown request, then uses sustained loss of guest SSH plus a settle interval as conservative operational evidence before reaping only the recorded managed process. It is not a Virtualization.framework state attestation. If that evidence or runner identity cannot be confirmed, the operation aborts before copying and never invokes Lume's destructive stop fallback. Existing VM data and completed backups are preserved. A failed clone directory has no `gremvm-backup.json` completion manifest and must not be used as a backup. No automatic deletion or retention runs.
 
-## Optional encrypted off-site history
+## Add encrypted off-site history with restic and Keytap
 
-The Nix shell provides restic and Keytap. Keytap can derive the restic password without adding a plaintext password or a ClipKitty recipient to this repository:
+The Nix shell contains pinned restic and Keytap tools. Keytap can deterministically derive the repository password instead of storing a plaintext password or an age envelope in this repo:
 
 ```sh
 nix develop path:.
 keytap remember gremvm-restic
 
 export RESTIC_REPOSITORY='s3:s3.example.net/my-private-bucket/gremvm'
-restic \
-  --password-command 'keytap reveal gremvm-restic --as hex' \
-  init
+restic --password-command 'keytap reveal gremvm-restic --as hex' init
 ```
 
-Back up the completed pair printed by `gremvm backup`:
+`keytap remember` is an explicit machine-local choice. On macOS it stores the derived key in the owning user's login keychain; consequently unattended restic work is available only after that user logs in, matching the VM LaunchAgent boundary. This repository contains no backup password and no additional ClipKitty recipient.
+
+After creating a stopped clone, back up that exact directory:
 
 ```sh
-EXPORT='/Volumes/GremVM Backup/tart/work--20260724T210000Z.tvm'
-MANIFEST="$EXPORT.manifest.json"
+CLONE='/Volumes/GremVM Backup/lume/work--20260724T210000Z'
+CONTROL="$HOME/Library/Application Support/GremVM"
 
 restic \
   --repository "$RESTIC_REPOSITORY" \
@@ -92,19 +72,22 @@ restic \
   --group-by host,tags \
   --tag gremvm \
   --tag work \
-  "$EXPORT" \
-  "$MANIFEST"
+  --exclude "$CONTROL/state/maintenance.lock" \
+  --exclude "$CONTROL/state/runner-owner" \
+  "$CLONE" \
+  "$CONTROL/config" \
+  "$CONTROL/ssh" \
+  "$CONTROL/state" \
+  "$CONTROL/versions"
 ```
 
-Use the manifest path actually printed by the command if its name differs from the example. Save a copy of the small GremVM configuration separately if you want the same host defaults after total host loss; the `.tvm` remains the authoritative guest-data backup.
+The small control-plane directories are included because a host-loss recovery needs the pinned configuration, provision state, forced shutdown private key, and pinned guest host key. The transient operation lock is excluded. Restic encrypts this material; keep restored key/state files mode `0600` and directories mode `0700`. The Lume runtime and logs are deliberately excluded because `gremvm install` reconstructs the runtime from its reviewed pin.
 
-Because each `.tvm` is a compressed whole-VM archive, cross-snapshot deduplication may be limited. Measure repository growth before choosing a long retention period. Keep `--group-by host,tags` on both backup and retention commands: timestamped export paths differ, so path-based grouping would otherwise give every generation its own retention group.
+Repository credentials for S3/B2/etc. are separate from the restic encryption password. Keep them in an existing OS keychain or backup product, not this repository or the guest.
 
-Repository credentials and the Keytap passkey are separate recovery dependencies. Keep both outside the guest. `keytap remember` uses the owning user's login keychain on macOS, so unattended restic work is available only after that user logs in.
+## Retention and verification
 
-## Retention and checks
-
-Keep at least two verified local exports. Apply off-site retention only after reviewing a dry run:
+Run a dry run first. `--group-by host,tags` is essential because each clone has a different timestamped source path; without it, restic would apply retention independently to one-snapshot path groups.
 
 ```sh
 restic \
@@ -120,77 +103,85 @@ restic \
   --dry-run
 ```
 
-When the selection is correct, repeat without `--dry-run` and add `--prune`. This does not remove the external `.tvm` files; delete an old local export and its matching manifest only after a newer off-site snapshot and restore drill succeed.
+Review the groups and selections, then repeat without `--dry-run` and add `--prune`:
 
-Run a restic metadata check weekly and read a rotating subset of data monthly:
+```sh
+restic \
+  --repository "$RESTIC_REPOSITORY" \
+  --password-command 'keytap reveal gremvm-restic --as hex' \
+  forget \
+  --group-by host,tags \
+  --tag gremvm,work \
+  --keep-daily 7 \
+  --keep-weekly 5 \
+  --keep-monthly 12 \
+  --keep-yearly 3 \
+  --prune
+```
+
+This restic policy does not remove the directly bootable clones on the external SSD. Review those separately after a successful off-site snapshot and restore drill. Keep at least two known-good local generations, inspect an exact old clone with `"$LUME" get OLD_NAME --storage "/Volumes/GremVM Backup/lume"`, and delete only that named clone with `"$LUME" delete OLD_NAME --storage "/Volumes/GremVM Backup/lume"`. Never automate local deletion and never remove the newest verified copy.
+
+Also run a repository metadata check weekly:
 
 ```sh
 restic \
   --repository "$RESTIC_REPOSITORY" \
   --password-command 'keytap reveal gremvm-restic --as hex' \
   check
+```
 
+Each month, replace `N` with the next number from 1 through 12 so the whole repository is read over a year:
+
+```sh
 restic \
   --repository "$RESTIC_REPOSITORY" \
   --password-command 'keytap reveal gremvm-restic --as hex' \
-  check --read-data-subset=1/12
+  check --read-data-subset=N/12
 ```
 
-Rotate `1/12` through `12/12`. Restic documents [repository setup](https://restic.readthedocs.io/en/stable/030_preparing_a_new_repo.html), [retention](https://restic.readthedocs.io/en/stable/060_forget.html), and [restore](https://restic.readthedocs.io/en/stable/050_restore.html).
+Run a full restore/boot drill quarterly.
+
+Restic documents [repository setup and password commands](https://restic.readthedocs.io/en/stable/030_preparing_a_new_repo.html), [retention](https://restic.readthedocs.io/en/stable/060_forget.html), and [restore](https://restic.readthedocs.io/en/stable/050_restore.html).
 
 ## Restore without overwriting production
 
-Always import under a new VM name and into the managed `TART_HOME`. Stop the
-original first and keep it intact until the recovery copy has booted and its
-work data has been checked. Importing beside the original lets Tart detect the
-hardware-identity collision and regenerate the restored VM's MAC address.
+Always restore under a new name/path. Preserve the live VM until the recovery copy has booted and its application data is checked.
 
-For a direct external export:
+Resolve the installed, pinned Lume executable first; it is intentionally not added globally to `PATH`:
 
 ```sh
-EXPORT='/Volumes/GremVM Backup/tart/work--20260724T210000Z.tvm'
-"$GREMVM" stop
-
-# Compare this digest with the completion manifest first.
-/usr/bin/shasum -a 256 "$EXPORT"
-/usr/bin/aa list -i "$EXPORT" -list-format json >/dev/null
-
-TART_HOME="$TART_HOME" "$TART" import "$EXPORT" work-restore-test
-TART_HOME="$TART_HOME" "$TART" run work-restore-test
+LUME="$("$GREMVM" runtime-path)"
 ```
 
-For restic, restore to a new scratch directory and then import:
+Only directories containing a valid `gremvm-backup.json` are complete backups. For a direct Lume clone on the external volume:
 
 ```sh
-mkdir -m 700 "/Volumes/Restore Scratch/gremvm"
+# Inspect the timestamped backup first.
+"$LUME" get work--20260724T210000Z \
+  --storage "/Volumes/GremVM Backup/lume" \
+  --format json
+
+# Clone it back to a NEW VM in live storage.
+"$LUME" clone work--20260724T210000Z work-restore-test \
+  --source-storage "/Volumes/GremVM Backup/lume" \
+  --dest-storage "$HOME/Library/Application Support/GremVM/vms"
+```
+
+For restic, restore sparse files to a new scratch directory so the virtual disk does not allocate its full logical size:
+
+```sh
+mkdir -m 700 "/Volumes/Restore Scratch/work"
 restic \
   --repository "$RESTIC_REPOSITORY" \
   --password-command 'keytap reveal gremvm-restic --as hex' \
   restore latest \
   --tag gremvm,work \
-  --target "/Volumes/Restore Scratch/gremvm"
-
-EXPORT='/Volumes/Restore Scratch/gremvm/path/to/work--20260724T210000Z.tvm'
-MANIFEST="$EXPORT.manifest.json"
-
-# Repeat the filename, size, SHA-256, and Apple Archive checks above against
-# the restored pair before importing it.
-TART_HOME="$TART_HOME" "$TART" import "$EXPORT" work-restore-test
-TART_HOME="$TART_HOME" "$TART" run work-restore-test
+  --sparse \
+  --target "/Volumes/Restore Scratch/work"
 ```
 
-Inside the restored guest, verify the macOS version, work files, application
-state, and any boot-policy assumption you rely on. Test its SSH service directly
-from the host over Tart's private address; the one production Cloudflare
-hostname remains bound to `work`. SIP is not asserted by the backup manifest;
-run `csrutil status` if it matters. Shut the restore guest down from macOS, then
-return the managed VM to service:
+Then locate the restored VM directory and use `"$LUME" get`/`"$LUME" clone` with direct `--storage` paths. Restore `config`, `ssh`, `state` (without `maintenance.lock`), and `versions` separately with directory mode `0700` and file mode `0600`; do not overwrite a working host control plane until the recovery copy has been inspected. Keep the production supervisor stopped while using raw Lume. Boot only the new `work-restore-test`, verify work files and application state, run `csrutil status` inside it, and confirm the result is `disabled`. Shut the test guest down from inside macOS before using `"$LUME" stop` or deleting anything, and never run the restored and original identities simultaneously.
 
-```sh
-"$GREMVM" start
-```
+Never restore by copying only `disk.img`, never overwrite `work` in place, and never prune the last verified external and off-site copies together.
 
-Delete `work-restore-test` only after recording the successful drill, or keep it
-stopped for further inspection.
-
-Perform this drill quarterly from a second Apple-silicon Mac whose macOS version supports the restored guest. Never import over `work`, run original and restored identities simultaneously, or prune the final known-good local and off-site copies together.
+The Keytap name/passkey and the storage backend credentials are separate recovery dependencies. Sync the Keytap passkey through its intended mechanism, escrow backend recovery material outside the guest, and perform the quarterly restore from a second Apple-silicon Mac running the same or a newer macOS version than the Tahoe guest so the test covers loss of the Mac Studio itself.

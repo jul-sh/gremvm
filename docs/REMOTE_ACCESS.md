@@ -1,222 +1,78 @@
-# SSH remote access through Cloudflare
+# Secure remote access
 
-GremVM exposes only the guest's normal macOS SSH service. There is no browser
-desktop, VNC, WebRTC, TURN, custom signaling protocol, guest agent, router
-port-forward, or public port 22.
+The remote desktop lives **inside the guest**. Lume's host VNC server is a local break-glass console, not the remote-access product.
 
-```text
-OpenSSH client
-  └─ cloudflared ProxyCommand + Cloudflare Access
-       └─ Cloudflare Tunnel on the Mac Studio
-            └─ ssh://<current Tart guest IP>:22
-                 └─ macOS guest sshd
-```
+Examples use `GREMVM="$HOME/Library/Application Support/GremVM/bin/gremvm"` as the installed command.
 
-The client application protocol remains SSH end to end. Cloudflare's published
-non-HTTP service transport uses WebSocket, so client-side `cloudflared` is
-required. This is not WebRTC. Raw `ssh hostname` without a `ProxyCommand`
-requires a different Cloudflare product/topology such as WARP private routing
-or Spectrum.
-
-Cloudflare documents this flow in
-[SSH with client-side cloudflared](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/use-cases/ssh/ssh-cloudflared-authentication/).
-
-## Provision Cloudflare
-
-### Cloudflare API token
-
-Create a **user API token** in Cloudflare Dashboard: **My Profile** → **API
-Tokens** → **Create Token** → **Create Custom Token**. Use a name such as
-`gremvm-provisioner`, and grant exactly the following permissions:
-
-| Scope | Permission | Resource selection |
-| --- | --- | --- |
-| Zone | Zone / Read | Include the specific `eviljuliette.com` zone |
-| Zone | DNS / Edit | Include the specific `eviljuliette.com` zone |
-| Account | Cloudflare Tunnel / Edit | Include the account that owns `eviljuliette.com` |
-| Account | Access: Apps and Policies / Edit | Include the account that owns `eviljuliette.com` |
-
-Cloudflare sometimes calls the `Edit` operations `Write` in API responses;
-select `Edit` in the Dashboard. Do not use a Global API Key, an all-accounts
-scope, an all-zones scope, or a token shared with another project. Set an
-expiration you will rotate (one year is a practical default); add an IP filter
-only if the administrative egress address is stable.
-
-Cloudflare shows the value once. Do not paste it into chat or a shell command.
-At the GremVM checkout, use the hidden prompt to create the one-recipient
-Keytap envelope:
-
-```sh
-cd /Users/julsh/git/gremvm
-nix develop path:. -c ./scripts/store-cloudflare-api-token.sh
-```
-
-The token is used only by `cloudflare-setup.sh` during reconciliation. It is
-not copied to the Mac Studio service; that service receives only the
-single-Tunnel connector credential created by `apply`.
-
-Run this on a trusted machine with the repository and the Keytap identity:
-
-```sh
-cd /Users/julsh/git/gremvm
-export GREMVM_CLOUDFLARE_ACCESS_EMAIL='you@example.com'
-
-nix develop path:. -c ./scripts/cloudflare-setup.sh check
-nix develop path:. -c ./scripts/cloudflare-setup.sh apply
-```
-
-`check` is read-only. It verifies the API token, zone, same-named Tunnel, exact
-hostname record, Access application, and exclusive email policy before any
-mutation. `apply` creates only missing managed resources and is safe to rerun.
-It refuses conflicting or partially owned resources instead of overwriting or
-deleting them.
-
-The resulting resources are:
-
-- one locally managed Tunnel named `gremvm`;
-- proxied CNAME `gremvm.eviljuliette.com` to that Tunnel; and
-- a self-hosted Access application with one allow policy for
-  `GREMVM_CLOUDFLARE_ACCESS_EMAIL`.
-
-A local Tunnel configuration is intentional here: Tart's NAT address is known
-only after the VM starts. The supervisor resolves it each run and generates a
-private ingress file. This avoids retaining the account API token at runtime or
-adding a separate TCP forwarder. Cloudflare still documents
-[locally managed ingress configuration](https://developers.cloudflare.com/tunnel/advanced/local-management/configuration-file/),
-including `ssh://` origins.
-
-## Install the connector credential
-
-`apply` backs up the one-Tunnel credential as a Keytap-only envelope. On the Mac
-Studio, materialize the operational copy:
-
-```sh
-cd /Users/julsh/git/gremvm
-nix develop path:. -c ./scripts/cloudflare-install-host.sh
-
-GREMVM="$HOME/Library/Application Support/GremVM/bin/gremvm"
-"$GREMVM" restart
-"$GREMVM" status
-```
-
-The installed JSON is mode 0600 under the owning account's GremVM directory.
-Cloudflare documents that this credential can run its one Tunnel and cannot
-manage the account. The broader API token is decrypted only during setup and is
-never copied into host runtime.
-
-`status` reports either:
+## Required topology
 
 ```text
-ssh: configured (gremvm.eviljuliette.com)
-ssh: not-configured
+your device ── private Tailscale tailnet ── macOS guest
+                                             ├─ Screen Sharing (GUI)
+                                             └─ SSH (key only, if needed)
+
+Mac Studio host ── local-only Lume console
 ```
 
-`configured` means the tunnel credential is present. It does not prove that
-the connector, Access login, guest `sshd`, or guest credentials are healthy;
-use the external acceptance test below.
+- Keep the Lume VM network in NAT mode. GremVM passes `--network nat` explicitly.
+- Install Tailscale inside the guest and use its system service so the node returns at guest boot.
+- Permit only your identity/devices through tailnet ACLs; require MFA/device approval.
+- Enable macOS Screen Sharing only for the dedicated guest work account.
+- Keep guest Remote Login (sshd) enabled: GremVM's forced shutdown key always needs it. Add your own key and disable password authentication after setup if interactive SSH is needed.
+- Never forward router ports for SSH, Screen Sharing, or VNC.
+- Do not share host directories or enable Lume clipboard integration for a SIP-disabled guest.
 
-The tunnel shares the VM supervisor. It waits for guest SSH, generates ingress
-for the current private IP, retries `cloudflared` after failure, and exits
-before GremVM requests guest shutdown. Connector messages are in the normal
-logs:
+Tailscale publishes its [macOS client variants and service behavior](https://tailscale.com/docs/concepts/macos-variants). Authentication keys, OAuth credentials, tailnet policy, and expiry rules belong to the tailnet/secret manager, not this repository.
+
+## Bootstrap checklist
+
+Lume's unattended setup intentionally starts with an insecure convenience account. Before adding work data, source-control tokens, Apple signing identities, or cloud credentials:
+
+1. Run `"$GREMVM" console` locally.
+2. Sign in as `lume` / `lume` and change the password immediately.
+3. Confirm `csrutil status` says `disabled`.
+4. Install OS updates, then re-check SIP and Lume compatibility.
+5. Install Tailscale in the guest and authenticate it to the intended tailnet.
+6. Enable Screen Sharing for only the work account.
+7. Keep Remote Login enabled for the `lume` account so clean host shutdown and backups continue to work. Add your own SSH public key; verify it from an external network; then disable password authentication if desired—do not disable sshd or remove GremVM's forced-command key.
+8. Decide whether guest automatic login is necessary. If not, disable it and remove the stale `/etc/kcpassword`; re-enable screen locking.
+9. Verify remote access from a genuinely off-LAN network before leaving the Mac Studio unattended.
+
+After completing and testing the checklist, clear the persistent status reminder explicitly:
 
 ```sh
-"$GREMVM" logs --lines 200
-"$GREMVM" logs --follow
+"$GREMVM" acknowledge-hardening --confirm
 ```
 
-On macOS 15 or newer, the first connection from `cloudflared` to Tart's private
-address may trigger a Local Network privacy prompt. Approve it once while the
-owning host user is logged in. GremVM does not modify that preference.
+Lume's SIP Recovery automation currently accepts administrator passwords made only from lowercase ASCII letters, digits, and hyphens. A long multiword passphrase in that alphabet preserves the ability to run `nix develop path:. -c "$GREMVM" sip-off` later; the pinned Nix shell supplies Lume's optional `vncdo` dependency. If you disable SSH password authentication, future SIP changes require temporarily restoring that access from the local console because Lume 0.4.0's SIP preflight is password-based.
 
-## Configure an SSH client
+## Host VNC boundary
 
-Install `cloudflared` on the client. Its absolute path varies by platform; on a
-Nix client use `command -v cloudflared`, and with Homebrew use
-`brew --prefix cloudflared`.
-
-Add to `~/.ssh/config`:
-
-```sshconfig
-Host gremvm
-  HostName gremvm.eviljuliette.com
-  User grem
-  ProxyCommand /absolute/path/cloudflared access ssh --hostname %h
-  StrictHostKeyChecking yes
-```
-
-The first connection opens a browser for the Cloudflare Access login, then
-macOS `sshd` asks for the guest password or uses a normal authorized key.
-
-### Pin the guest host key
-
-Do not accept a first-use key remotely without comparison. GremVM records the
-guest's Ed25519 host key during local bootstrap at:
-
-```text
-~/Library/Application Support/GremVM/ssh/guest-host-key
-```
-
-On the Mac Studio, inspect its fingerprint over a trusted local path:
+`lume run --no-display` still starts a VNC listener. Lume 0.4.0 creates an external-host URL as well as a localhost URL, and VNC authentication has legacy limitations. Therefore `"$GREMVM" install` requires macOS Application Firewall to be enabled and adds a deny-inbound rule for the exact notarized `lume.app`:
 
 ```sh
-ssh-keygen -lf "$HOME/Library/Application Support/GremVM/ssh/guest-host-key"
+"$GREMVM" firewall-check
 ```
 
-Securely copy the key line to the client and prefix it with the public hostname
-in `~/.ssh/known_hosts`:
+The LaunchAgent runs with umask `077`, private VM/log directories, telemetry disabled, error-only Lume logs, a dynamic VNC port, no shared directories, no clipboard, and no Lume HTTP API. Test the firewall from another LAN machine while the VM is running; the random VNC port must not be reachable. The local `"$GREMVM" console` must still work.
 
-```text
-gremvm.eviljuliette.com ssh-ed25519 AAAA...
-```
+If a version upgrade changes the app path, rerunning `"$GREMVM" install` installs and verifies a rule for that exact version before provisioning/start. Do not set `GREMVM_REQUIRE_APPLICATION_FIREWALL=false` unless an independently verified host firewall provides the same deny-inbound boundary.
 
-Now ordinary tools work:
+## Host recovery boundary
 
-```sh
-ssh gremvm
-scp ./file gremvm:~/
-sftp gremvm
-```
+This deployment starts only when the owning account logs in. Keep that account logged in and lock the screen instead of logging out. After a cold boot with FileVault, someone must unlock and log in locally before the VM and guest Tailscale node can return. GremVM does not enable host automatic login, alter FileVault, enable host SSH, or install a host overlay.
 
-The bootstrap's separate forced-command key is only for managed shutdown. Do
-not reuse or broaden it. After the first password-authenticated session, add
-your own public key to the guest account's `~/.ssh/authorized_keys` and verify a
-new key-authenticated session before changing guest SSH policy.
+If unattended recovery after a power outage is non-negotiable, the owner needs an independent out-of-band path to unlock/login to the Mac Studio. Neither Lume nor Tart provides a supported way around the modern login-keychain requirement without reintroducing stored credentials or automatic login.
 
-## Acceptance test
+## Acceptance tests
 
-From a genuinely off-LAN client:
+From outside the home LAN:
 
-1. Confirm Access rejects an identity other than the configured email.
-2. Confirm the configured identity reaches the SSH host-key check.
-3. Compare the fingerprint with the locally recorded key, then log in.
-4. Verify `ssh`, `scp`, and `sftp` all work.
-5. Restart the guest and verify access returns without changing client config.
-6. Lock the Mac Studio screen and verify SSH continues.
-7. Log out or cold-boot the Mac Studio and confirm the documented boundary:
-   access returns only after the owning host account logs in.
-8. Stop the VM and verify SSH becomes unreachable; start it and verify recovery.
-9. Restore a stopped `.tvm` under a new name and test its SSH service directly
-   from the host's private Tart network. The one production hostname remains
-   bound to the managed `work` VM.
+1. Lock (do not log out of) the host account; verify guest Screen Sharing/SSH still works.
+2. Restart the guest; verify Tailscale and access return without opening public ports.
+3. Break guest Tailscale deliberately; use the local host console to diagnose it.
+4. Reboot the host and exercise the documented FileVault/login boundary.
+5. From another LAN device, verify Lume's VNC port is blocked.
+6. Restore a backup under a new VM name and repeat remote access plus `csrutil status` checks.
 
-## Troubleshooting and lifecycle
-
-- `ssh: not-configured`: rerun `cloudflare-install-host.sh` after a successful
-  Cloudflare `apply`.
-- Access login fails: rerun `cloudflare-setup.sh check` with the exact email
-  used during `apply`.
-- Tunnel repeatedly reconnects: inspect `gremvm logs`, Internet connectivity,
-  and host Local Network permission.
-- Access succeeds but SSH fails: use `gremvm console` and verify Remote Login,
-  the `grem` account, and its authentication settings inside the guest.
-- Host-key mismatch: GremVM refuses the clean SSH shutdown path and tunnel
-  exposure. A stop may use Tart's destructive fallback. Investigate from the
-  local console; never overwrite the pinned key merely to silence the warning.
-
-`gremvm uninstall` preserves the runtime tunnel credential and never deletes
-Cloudflare resources. This keeps data and remote configuration recoverable.
-Deletion or credential rotation is deliberately manual and destructive: first
-stop remote use, remove/recreate the Tunnel in Cloudflare, delete the old
-runtime credential and recovery envelope, then rerun `apply` and the host
-installer. Do not reuse a credential after suspected disclosure.
+Record the host/guest OS versions, Lume pin, FileVault state, firewall result, tailnet policy revision, SSH-key fingerprints, and last successful cold-boot/restore test.
