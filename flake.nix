@@ -3,14 +3,12 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-26.05-darwin";
-    keytap.url = "github:jul-sh/keytap/9e1fc2930df7f6810ce2ca347822195cee0785d9";
   };
 
   outputs =
     {
       self,
       nixpkgs,
-      keytap,
     }:
     let
       systems = [ "aarch64-darwin" ];
@@ -46,15 +44,6 @@
         in
         {
           vncdotool = vncdotoolFor system;
-          restic = pkgs.restic;
-          keytap = keytap.packages.${system}.default;
-          default = pkgs.writeShellApplication {
-            name = "gremvm";
-            runtimeInputs = [ ];
-            text = ''
-              exec ${self}/bin/gremvm "$@"
-            '';
-          };
         }
       );
 
@@ -68,11 +57,9 @@
             packages = [
               pkgs.bats
               pkgs.nixfmt
-              pkgs.restic
               pkgs.shellcheck
               pkgs.shfmt
               (vncdotoolFor system)
-              keytap.packages.${system}.default
             ];
           };
         }

@@ -6,23 +6,23 @@ setup() {
     mkdir -p "$TEST_HOME"
 }
 
-@test "help exposes only the fixed lifecycle surface" {
+@test "help exposes only the lifecycle surface" {
     run env HOME="$TEST_HOME" "$REPO_ROOT/bin/gremvm" --help
     [ "$status" -eq 0 ]
     [[ "$output" == *"install"* ]]
     [[ "$output" == *"provision"* ]]
     [[ "$output" == *"start | stop | restart"* ]]
     [[ "$output" == *"logs"* ]]
-    [[ "$output" == *"backup"* ]]
     [[ "$output" == *"uninstall"* ]]
-    [[ "$output" != *"--destination"* ]]
+    [[ "$output" != *"backup"* ]]
+    [[ "$output" != *"console"* ]]
     [[ "$output" != *"sip-off"* ]]
     [[ "$output" != *"firewall-check"* ]]
     [[ "$output" != *"runtime-path"* ]]
     [[ "$output" != *"acknowledge-hardening"* ]]
 }
 
-@test "status is a typed not-installed state in an empty home" {
+@test "status is not-installed in an empty home" {
     run env HOME="$TEST_HOME" "$REPO_ROOT/bin/gremvm" status
     [ "$status" -eq 0 ]
     [ "$output" = "state: not-installed" ]
@@ -34,10 +34,12 @@ setup() {
     [[ "$output" == *"unknown command"* ]]
 }
 
-@test "release pin is exact and complete" {
+@test "release pin is exact and contains only fields used by the wrapper" {
     run sh -c '. "$1"; printf "%s %s %s" "$LUME_VERSION" "$LUME_TEAM_ID" "$LUME_ARCHIVE_SHA256"' sh "$REPO_ROOT/versions/lume.env"
     [ "$status" -eq 0 ]
     [ "$output" = "0.4.0 YCK386LBJ7 8b44bbcc5ae9693f4b1343fea58aadddd37053fa990cd234e703c8c9e73b1cba" ]
+    run grep -E '^LUME_(RELEASE_COMMIT|ARCHIVE_NIX_SHA256)=' "$REPO_ROOT/versions/lume.env"
+    [ "$status" -ne 0 ]
 }
 
 @test "no personal signing material remains in the deployment repo" {
@@ -57,27 +59,23 @@ setup() {
 @test "legacy configuration and environment values cannot alter the fixed VM" {
     legacy="$TEST_HOME/Library/Application Support/GremVM/config"
     mkdir -p "$legacy"
-    printf 'GREMVM_VM_NAME=other\nGREMVM_VM_STORAGE=/tmp/other\nGREMVM_CPU_COUNT=1\nGREMVM_REQUIRE_APPLICATION_FIREWALL=false\n' > "$legacy/gremvm.env"
-    run env HOME="$TEST_HOME" GREMVM_ROOT=/tmp/other GREMVM_VM_NAME='not valid' GREMVM_VM_STORAGE=/tmp/other GREMVM_CPU_COUNT=1 GREMVM_MEMORY=1GB GREMVM_DISK_SIZE=1GB GREMVM_DISPLAY=1x1 GREMVM_IPSW=/tmp/other.ipsw GREMVM_GUEST_ADMIN_USER=other GREMVM_SHUTDOWN_TIMEOUT=1 GREMVM_SHUTDOWN_SETTLE_SECONDS=0 GREMVM_REQUIRE_APPLICATION_FIREWALL=false GREMVM_BACKUP_DESTINATION=/tmp/other "$REPO_ROOT/bin/gremvm" status
+    printf 'GREMVM_VM_NAME=other\nGREMVM_VM_STORAGE=/tmp/other\nGREMVM_CPU_COUNT=1\n' > "$legacy/gremvm.env"
+    run env HOME="$TEST_HOME" GREMVM_ROOT=/tmp/other GREMVM_VM_NAME=other GREMVM_VM_STORAGE=/tmp/other GREMVM_CPU_COUNT=1 GREMVM_MEMORY=1GB GREMVM_DISK_SIZE=1GB GREMVM_DISPLAY=1x1 GREMVM_IPSW=/tmp/other.ipsw GREMVM_GUEST_ADMIN_USER=other GREMVM_BACKUP_DESTINATION=/tmp/other "$REPO_ROOT/bin/gremvm" status
     [ "$status" -eq 0 ]
     [ "$output" = "state: not-installed" ]
-    [ ! -e "$REPO_ROOT/config/gremvm.env.example" ]
 }
 
-@test "public commands reject options" {
+@test "public commands reject options and removed commands" {
     run env HOME="$TEST_HOME" "$REPO_ROOT/bin/gremvm" logs --follow
     [ "$status" -ne 0 ]
     [[ "$output" == *"usage: gremvm logs"* ]]
 
-    run env HOME="$TEST_HOME" "$REPO_ROOT/bin/gremvm" backup --destination /tmp/backup
+    run env HOME="$TEST_HOME" "$REPO_ROOT/bin/gremvm" backup
     [ "$status" -ne 0 ]
-    [[ "$output" == *"usage: gremvm backup"* ]]
+    [[ "$output" == *"unknown command: backup"* ]]
 }
 
 @test "uninstall preserves the fixed VM path" {
-    if [ -z "$(/bin/ps -p $$ -o lstart= 2> /dev/null)" ]; then
-        skip "Darwin Nix build sandbox hides process start identity"
-    fi
     root="$TEST_HOME/Library/Application Support/GremVM"
     mkdir -p "$root/vms/work"
     printf 'preserve\n' > "$root/vms/work/sentinel"
