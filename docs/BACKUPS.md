@@ -6,7 +6,7 @@ Examples use the canonical installed command path:
 
 ```sh
 GREMVM="$HOME/Library/Application Support/GremVM/bin/gremvm"
-LUME="$("$GREMVM" runtime-path)"
+LUME="$HOME/Library/Application Support/GremVM/runtime/current/lume.app/Contents/MacOS/lume"
 ```
 
 ## Recommended 3-2-1 layout
@@ -30,7 +30,7 @@ GremVM deliberately refuses to create missing `/Volumes` paths. If the disk is a
 ## Create a bootable clone
 
 ```sh
-"$GREMVM" backup --destination "/Volumes/GremVM Backup/lume"
+"$GREMVM" backup
 ```
 
 The command requires the GremVM supervisor to be loaded and the VM to have reached `state: running`. This restriction excludes raw/unmanaged Lume processes, whose exit cannot be proven safely. If the VM is stopped, run `"$GREMVM" start`, wait for `state: running`, and retry. The command then:
@@ -75,13 +75,12 @@ restic \
   --exclude "$CONTROL/state/maintenance.lock" \
   --exclude "$CONTROL/state/runner-owner" \
   "$CLONE" \
-  "$CONTROL/config" \
   "$CONTROL/ssh" \
   "$CONTROL/state" \
   "$CONTROL/versions"
 ```
 
-The small control-plane directories are included because a host-loss recovery needs the pinned configuration, provision state, forced shutdown private key, and pinned guest host key. The transient operation lock is excluded. Restic encrypts this material; keep restored key/state files mode `0600` and directories mode `0700`. The Lume runtime and logs are deliberately excluded because `gremvm install` reconstructs the runtime from its reviewed pin.
+The small control-plane directories are included because a host-loss recovery needs the provision state, forced shutdown private key, and pinned guest host key. GremVM has no deployment configuration file. The transient operation lock is excluded. Restic encrypts this material; keep restored key/state files mode `0600` and directories mode `0700`. The Lume runtime and logs are deliberately excluded because `gremvm install` reconstructs the runtime from its reviewed pin.
 
 Repository credentials for S3/B2/etc. are separate from the restic encryption password. Keep them in an existing OS keychain or backup product, not this repository or the guest.
 
@@ -147,10 +146,10 @@ Restic documents [repository setup and password commands](https://restic.readthe
 
 Always restore under a new name/path. Preserve the live VM until the recovery copy has booted and its application data is checked.
 
-Resolve the installed, pinned Lume executable first; it is intentionally not added globally to `PATH`:
+The installed, pinned Lume executable is intentionally not added globally to `PATH`:
 
 ```sh
-LUME="$("$GREMVM" runtime-path)"
+LUME="$HOME/Library/Application Support/GremVM/runtime/current/lume.app/Contents/MacOS/lume"
 ```
 
 Only directories containing a valid `gremvm-backup.json` are complete backups. For a direct Lume clone on the external volume:
@@ -180,7 +179,7 @@ restic \
   --target "/Volumes/Restore Scratch/work"
 ```
 
-Then locate the restored VM directory and use `"$LUME" get`/`"$LUME" clone` with direct `--storage` paths. Restore `config`, `ssh`, `state` (without `maintenance.lock`), and `versions` separately with directory mode `0700` and file mode `0600`; do not overwrite a working host control plane until the recovery copy has been inspected. Keep the production supervisor stopped while using raw Lume. Boot only the new `work-restore-test`, verify work files and application state, run `csrutil status` inside it, and confirm the result is `disabled`. Shut the test guest down from inside macOS before using `"$LUME" stop` or deleting anything, and never run the restored and original identities simultaneously.
+Then locate the restored VM directory and use `"$LUME" get`/`"$LUME" clone` with direct `--storage` paths. Restore `ssh`, `state` (without `maintenance.lock`), and `versions` separately with directory mode `0700` and file mode `0600`; do not overwrite a working host control plane until the recovery copy has been inspected. Keep the production supervisor stopped while using raw Lume. Boot only the new `work-restore-test`, verify work files and application state, run `csrutil status` inside it, and confirm the result is `disabled`. Shut the test guest down from inside macOS before using `"$LUME" stop` or deleting anything, and never run the restored and original identities simultaneously.
 
 Never restore by copying only `disk.img`, never overwrite `work` in place, and never prune the last verified external and off-site copies together.
 

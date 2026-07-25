@@ -38,25 +38,15 @@ Lume's unattended setup intentionally starts with an insecure convenience accoun
 8. Decide whether guest automatic login is necessary. If not, disable it and remove the stale `/etc/kcpassword`; re-enable screen locking.
 9. Verify remote access from a genuinely off-LAN network before leaving the Mac Studio unattended.
 
-After completing and testing the checklist, clear the persistent status reminder explicitly:
-
-```sh
-"$GREMVM" acknowledge-hardening --confirm
-```
-
-Lume's SIP Recovery automation currently accepts administrator passwords made only from lowercase ASCII letters, digits, and hyphens. A long multiword passphrase in that alphabet preserves the ability to run `nix develop path:. -c "$GREMVM" sip-off` later; the pinned Nix shell supplies Lume's optional `vncdo` dependency. If you disable SSH password authentication, future SIP changes require temporarily restoring that access from the local console because Lume 0.4.0's SIP preflight is password-based.
+`gremvm status` intentionally keeps reminding you to verify that the initial `lume` / `lume` password was changed. There is no acknowledgement switch that can hide that reminder.
 
 ## Host VNC boundary
 
 `lume run --no-display` still starts a VNC listener. Lume 0.4.0 creates an external-host URL as well as a localhost URL, and VNC authentication has legacy limitations. Therefore `"$GREMVM" install` requires macOS Application Firewall to be enabled and adds a deny-inbound rule for the exact notarized `lume.app`:
 
-```sh
-"$GREMVM" firewall-check
-```
+The LaunchAgent runs with umask `077`, private VM/log directories, telemetry disabled, error-only Lume logs, a dynamic VNC port, no shared directories, no clipboard, and no Lume HTTP API. `gremvm status` reports whether the required firewall block is present. Test it from another LAN machine while the VM is running; the random VNC port must not be reachable. The local `"$GREMVM" console` must still work.
 
-The LaunchAgent runs with umask `077`, private VM/log directories, telemetry disabled, error-only Lume logs, a dynamic VNC port, no shared directories, no clipboard, and no Lume HTTP API. Test the firewall from another LAN machine while the VM is running; the random VNC port must not be reachable. The local `"$GREMVM" console` must still work.
-
-If a version upgrade changes the app path, rerunning `"$GREMVM" install` installs and verifies a rule for that exact version before provisioning/start. Do not set `GREMVM_REQUIRE_APPLICATION_FIREWALL=false` unless an independently verified host firewall provides the same deny-inbound boundary.
+If a version upgrade changes the app path, rerunning `"$GREMVM" install` installs and verifies a rule for that exact version before provisioning/start. The firewall block is mandatory; GremVM has no opt-out.
 
 ## Host recovery boundary
 

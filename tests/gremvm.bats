@@ -6,14 +6,20 @@ setup() {
     mkdir -p "$TEST_HOME"
 }
 
-@test "help exposes the required lifecycle commands" {
+@test "help exposes only the fixed lifecycle surface" {
     run env HOME="$TEST_HOME" "$REPO_ROOT/bin/gremvm" --help
     [ "$status" -eq 0 ]
     [[ "$output" == *"install"* ]]
-    [[ "$output" == *"status"* ]]
+    [[ "$output" == *"provision"* ]]
     [[ "$output" == *"start | stop | restart"* ]]
     [[ "$output" == *"logs"* ]]
+    [[ "$output" == *"backup"* ]]
     [[ "$output" == *"uninstall"* ]]
+    [[ "$output" != *"--destination"* ]]
+    [[ "$output" != *"sip-off"* ]]
+    [[ "$output" != *"firewall-check"* ]]
+    [[ "$output" != *"runtime-path"* ]]
+    [[ "$output" != *"acknowledge-hardening"* ]]
 }
 
 @test "status is a typed not-installed state in an empty home" {
@@ -48,34 +54,34 @@ setup() {
     [ "$output" = "state: not-installed" ]
 }
 
-@test "firewall policy typo fails closed" {
-    run env HOME="$TEST_HOME" GREMVM_REQUIRE_APPLICATION_FIREWALL=treu "$REPO_ROOT/bin/gremvm" status
-    [ "$status" -ne 0 ]
-    [[ "$output" == *"must be true or false"* ]]
+@test "legacy configuration and environment values cannot alter the fixed VM" {
+    legacy="$TEST_HOME/Library/Application Support/GremVM/config"
+    mkdir -p "$legacy"
+    printf 'GREMVM_VM_NAME=other\nGREMVM_VM_STORAGE=/tmp/other\nGREMVM_CPU_COUNT=1\nGREMVM_REQUIRE_APPLICATION_FIREWALL=false\n' > "$legacy/gremvm.env"
+    run env HOME="$TEST_HOME" GREMVM_ROOT=/tmp/other GREMVM_VM_NAME='not valid' GREMVM_VM_STORAGE=/tmp/other GREMVM_CPU_COUNT=1 GREMVM_MEMORY=1GB GREMVM_DISK_SIZE=1GB GREMVM_DISPLAY=1x1 GREMVM_IPSW=/tmp/other.ipsw GREMVM_GUEST_ADMIN_USER=other GREMVM_SHUTDOWN_TIMEOUT=1 GREMVM_SHUTDOWN_SETTLE_SECONDS=0 GREMVM_REQUIRE_APPLICATION_FIREWALL=false GREMVM_BACKUP_DESTINATION=/tmp/other "$REPO_ROOT/bin/gremvm" status
+    [ "$status" -eq 0 ]
+    [ "$output" = "state: not-installed" ]
+    [ ! -e "$REPO_ROOT/config/gremvm.env.example" ]
 }
 
-@test "unsafe VM names are structurally rejected" {
-    run env HOME="$TEST_HOME" GREMVM_VM_NAME=.. "$REPO_ROOT/bin/gremvm" status
+@test "public commands reject options" {
+    run env HOME="$TEST_HOME" "$REPO_ROOT/bin/gremvm" logs --follow
     [ "$status" -ne 0 ]
-    [[ "$output" == *"must begin with an ASCII letter or digit"* ]]
+    [[ "$output" == *"usage: gremvm logs"* ]]
 
-    run env HOME="$TEST_HOME" GREMVM_VM_NAME=-work "$REPO_ROOT/bin/gremvm" status
+    run env HOME="$TEST_HOME" "$REPO_ROOT/bin/gremvm" backup --destination /tmp/backup
     [ "$status" -ne 0 ]
-    [[ "$output" == *"must begin with an ASCII letter or digit"* ]]
+    [[ "$output" == *"usage: gremvm backup"* ]]
 }
 
-@test "uninstall refuses runtime overlap with VM data before deletion" {
+@test "uninstall preserves the fixed VM path" {
     if [ -z "$(/bin/ps -p $$ -o lstart= 2> /dev/null)" ]; then
         skip "Darwin Nix build sandbox hides process start identity"
     fi
     root="$TEST_HOME/Library/Application Support/GremVM"
-    mkdir -p "$root/runtime"
-    printf 'preserve\n' > "$root/runtime/sentinel"
-    run env HOME="$TEST_HOME" GREMVM_VM_STORAGE="$root" GREMVM_VM_NAME=runtime "$REPO_ROOT/bin/gremvm" uninstall
-    [ "$status" -ne 0 ]
-    if [[ "$output" != *"runtime removal overlaps VM data"* ]]; then
-        printf 'unexpected output: %s\n' "$output" >&3
-        false
-    fi
-    [ -f "$root/runtime/sentinel" ]
+    mkdir -p "$root/vms/work"
+    printf 'preserve\n' > "$root/vms/work/sentinel"
+    run env HOME="$TEST_HOME" GREMVM_VM_STORAGE=/tmp/other GREMVM_VM_NAME=other "$REPO_ROOT/bin/gremvm" uninstall
+    [ "$status" -eq 0 ]
+    [ -f "$root/vms/work/sentinel" ]
 }

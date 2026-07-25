@@ -6,11 +6,22 @@ umask 077
 PROGRAM=${0##*/}
 LABEL=io.gremvm.lume
 HOST_HOME=$HOME
-DEFAULT_ROOT=$HOST_HOME/Library/Application\ Support/GremVM
-REQUESTED_ROOT=${GREMVM_ROOT:-$DEFAULT_ROOT}
-GREMVM_ROOT=$DEFAULT_ROOT
-INITIAL_ROOT=$GREMVM_ROOT
-CONFIG_PATH=$INITIAL_ROOT/config/gremvm.env
+GREMVM_ROOT=$HOST_HOME/Library/Application\ Support/GremVM
+GREMVM_VM_NAME=work
+GREMVM_VM_STORAGE=$GREMVM_ROOT/vms
+GREMVM_CPU_COUNT=4
+GREMVM_MEMORY=8GB
+GREMVM_DISK_SIZE=150GB
+GREMVM_DISPLAY=1920x1200
+GREMVM_GUEST_ADMIN_USER=lume
+GREMVM_SHUTDOWN_TIMEOUT=75
+GREMVM_SHUTDOWN_SETTLE_SECONDS=20
+GREMVM_BACKUP_DESTINATION=/Volumes/GremVM\ Backup/lume
+GREMVM_LUME_BIN=$GREMVM_ROOT/runtime/current/lume.app/Contents/MacOS/lume
+GREMVM_LAUNCH_AGENT=$HOST_HOME/Library/LaunchAgents/$LABEL.plist
+GREMVM_LOG_DIR=$GREMVM_ROOT/logs
+GREMVM_STATE_DIR=$GREMVM_ROOT/state
+GREMVM_SSH_DIR=$GREMVM_ROOT/ssh
 
 SCRIPT_PATH=$0
 case $SCRIPT_PATH in
@@ -33,7 +44,7 @@ done
 SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd -P)
 REPO_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIR/.." && pwd -P)
 VERSIONS_FILE=$REPO_ROOT/versions/lume.env
-readonly PROGRAM LABEL HOST_HOME DEFAULT_ROOT REQUESTED_ROOT INITIAL_ROOT CONFIG_PATH SCRIPT_DIR REPO_ROOT VERSIONS_FILE
+readonly PROGRAM LABEL HOST_HOME GREMVM_ROOT GREMVM_VM_NAME GREMVM_VM_STORAGE GREMVM_CPU_COUNT GREMVM_MEMORY GREMVM_DISK_SIZE GREMVM_DISPLAY GREMVM_GUEST_ADMIN_USER GREMVM_SHUTDOWN_TIMEOUT GREMVM_SHUTDOWN_SETTLE_SECONDS GREMVM_BACKUP_DESTINATION GREMVM_LUME_BIN GREMVM_LAUNCH_AGENT GREMVM_LOG_DIR GREMVM_STATE_DIR GREMVM_SSH_DIR SCRIPT_DIR REPO_ROOT VERSIONS_FILE
 
 die() {
     printf '%s: %s\n' "$PROGRAM" "$*" >&2
@@ -48,22 +59,6 @@ require_command() {
     command -v "$1" > /dev/null 2>&1 || die "required command not found: $1"
 }
 
-canonical_future_path() {
-    candidate=$1
-    suffix=
-    while [ ! -e "$candidate" ]; do
-        base=${candidate##*/}
-        parent=${candidate%/*}
-        [ -n "$parent" ] || parent=/
-        [ "$parent" != "$candidate" ] || return 1
-        suffix=/$base$suffix
-        candidate=$parent
-    done
-    [ -d "$candidate" ] || return 1
-    existing=$(CDPATH='' cd -- "$candidate" && pwd -P) || return 1
-    printf '%s%s\n' "$existing" "$suffix"
-}
-
 load_release() {
     [ -r "$VERSIONS_FILE" ] || die "missing release pin: $VERSIONS_FILE"
     # The release file is repository-controlled and contains assignments only.
@@ -71,115 +66,13 @@ load_release() {
     . "$VERSIONS_FILE"
 }
 
-load_config() {
-    GREMVM_VM_NAME=${GREMVM_VM_NAME:-work}
-    GREMVM_VM_STORAGE=${GREMVM_VM_STORAGE:-$GREMVM_ROOT/vms}
-    GREMVM_CPU_COUNT=${GREMVM_CPU_COUNT:-4}
-    GREMVM_MEMORY=${GREMVM_MEMORY:-8GB}
-    GREMVM_DISK_SIZE=${GREMVM_DISK_SIZE:-150GB}
-    GREMVM_DISPLAY=${GREMVM_DISPLAY:-1920x1200}
-    GREMVM_IPSW=${GREMVM_IPSW:-latest}
-    GREMVM_GUEST_ADMIN_USER=${GREMVM_GUEST_ADMIN_USER:-lume}
-    GREMVM_SHUTDOWN_TIMEOUT=${GREMVM_SHUTDOWN_TIMEOUT:-75}
-    GREMVM_SHUTDOWN_SETTLE_SECONDS=${GREMVM_SHUTDOWN_SETTLE_SECONDS:-20}
-    GREMVM_REQUIRE_APPLICATION_FIREWALL=${GREMVM_REQUIRE_APPLICATION_FIREWALL:-true}
-    if [ -r "$CONFIG_PATH" ]; then
-        # This file is created mode 0600 for the owning user. It deliberately
-        # supports quoted paths and is therefore sourced rather than parsed.
-        # shellcheck disable=SC1090
-        . "$CONFIG_PATH"
-    fi
-
-    [ "$REQUESTED_ROOT" = "$DEFAULT_ROOT" ] || die "GREMVM_ROOT is fixed at $DEFAULT_ROOT"
-    [ "$HOME" = "$HOST_HOME" ] || die "the deployment config may not change HOME"
-    [ "$GREMVM_ROOT" = "$INITIAL_ROOT" ] || die "the deployment config may not change GREMVM_ROOT"
-    GREMVM_LUME_BIN=$GREMVM_ROOT/runtime/current/lume.app/Contents/MacOS/lume
-    GREMVM_LAUNCH_AGENT=$HOST_HOME/Library/LaunchAgents/$LABEL.plist
-    GREMVM_LOG_DIR=$GREMVM_ROOT/logs
-    GREMVM_STATE_DIR=$GREMVM_ROOT/state
-    GREMVM_SSH_DIR=$GREMVM_ROOT/ssh
-
-    case $GREMVM_ROOT in
-        "$HOST_HOME"/*) ;;
-        *) die "GREMVM_ROOT must stay inside the owning user's home directory" ;;
-    esac
-    case /$GREMVM_ROOT/ in
-        */../* | */./*) die "GREMVM_ROOT may not contain dot path components" ;;
-    esac
-    [ "$GREMVM_ROOT" != "$HOME" ] || die "GREMVM_ROOT may not be the home directory itself"
-    canonical_home=$(CDPATH='' cd -- "$HOST_HOME" && pwd -P) || die "HOME must resolve to a directory"
-    resolved_root=$(canonical_future_path "$GREMVM_ROOT") || die "GREMVM_ROOT must resolve through directories"
-    root_suffix=${GREMVM_ROOT#"$HOST_HOME"}
-    [ "$resolved_root" = "$canonical_home$root_suffix" ] || die "GREMVM_ROOT may not traverse symbolic links below HOME"
-
-    case $GREMVM_VM_NAME in
-        [A-Za-z0-9]*) ;;
-        *) die "VM name must begin with an ASCII letter or digit: $GREMVM_VM_NAME" ;;
-    esac
-    case $GREMVM_VM_NAME in
-        *[!A-Za-z0-9._-]*) die "invalid VM name in $CONFIG_PATH: $GREMVM_VM_NAME" ;;
-    esac
-    case $GREMVM_VM_STORAGE in
-        /*) ;;
-        *) die "GREMVM_VM_STORAGE must be an absolute path" ;;
-    esac
-    case /$GREMVM_VM_STORAGE/ in
-        */../* | */./*) die "GREMVM_VM_STORAGE may not contain dot path components" ;;
-    esac
-    [ "$GREMVM_VM_STORAGE" != / ] || die "GREMVM_VM_STORAGE may not be the filesystem root"
-    resolved_storage=$(canonical_future_path "$GREMVM_VM_STORAGE") || die "GREMVM_VM_STORAGE must resolve through directories"
-    case $GREMVM_VM_STORAGE in
-        "$HOST_HOME"/*)
-            storage_suffix=${GREMVM_VM_STORAGE#"$HOST_HOME"}
-            expected_storage=$canonical_home$storage_suffix
-            ;;
-        *) expected_storage=$GREMVM_VM_STORAGE ;;
-    esac
-    [ "$resolved_storage" = "$expected_storage" ] || die "GREMVM_VM_STORAGE may not traverse symbolic links"
+validate_deployment() {
     [ ! -L "$GREMVM_VM_STORAGE/$GREMVM_VM_NAME" ] || die "VM directory may not be a symbolic link"
-    case $GREMVM_SHUTDOWN_TIMEOUT in
-        '' | *[!0-9]*) die "GREMVM_SHUTDOWN_TIMEOUT must be a positive integer" ;;
-    esac
-    [ "$GREMVM_SHUTDOWN_TIMEOUT" -gt 0 ] || die "GREMVM_SHUTDOWN_TIMEOUT must be greater than zero"
-    case $GREMVM_SHUTDOWN_SETTLE_SECONDS in
-        '' | *[!0-9]*) die "GREMVM_SHUTDOWN_SETTLE_SECONDS must be a non-negative integer" ;;
-    esac
-    [ "$GREMVM_SHUTDOWN_TIMEOUT" -le 600 ] || die "GREMVM_SHUTDOWN_TIMEOUT may not exceed 600 seconds"
-    [ "$GREMVM_SHUTDOWN_SETTLE_SECONDS" -le 300 ] || die "GREMVM_SHUTDOWN_SETTLE_SECONDS may not exceed 300 seconds"
-    case $GREMVM_CPU_COUNT in
-        '' | *[!0-9]*) die "GREMVM_CPU_COUNT must be a positive integer" ;;
-    esac
-    [ "$GREMVM_CPU_COUNT" -gt 0 ] || die "GREMVM_CPU_COUNT must be greater than zero"
-    case $GREMVM_MEMORY in
-        '' | *[!A-Za-z0-9]*) die "GREMVM_MEMORY must contain only a size and unit" ;;
-    esac
-    case $GREMVM_DISK_SIZE in
-        '' | *[!A-Za-z0-9]*) die "GREMVM_DISK_SIZE must contain only a size and unit" ;;
-    esac
-    case $GREMVM_IPSW in
-        latest | /*) ;;
-        *) die "GREMVM_IPSW must be 'latest' or an absolute local IPSW path" ;;
-    esac
-    display_width=${GREMVM_DISPLAY%x*}
-    display_height=${GREMVM_DISPLAY#*x}
-    [ "$display_width"x"$display_height" = "$GREMVM_DISPLAY" ] || die "GREMVM_DISPLAY must be WIDTHxHEIGHT"
-    case $display_width in
-        '' | *[!0-9]*) die "GREMVM_DISPLAY must be WIDTHxHEIGHT" ;;
-    esac
-    case $display_height in
-        '' | *[!0-9]*) die "GREMVM_DISPLAY must be WIDTHxHEIGHT" ;;
-    esac
-    [ "$display_width" -gt 0 ] && [ "$display_height" -gt 0 ] || die "GREMVM_DISPLAY dimensions must be positive"
-    case $GREMVM_REQUIRE_APPLICATION_FIREWALL in
-        true | false) ;;
-        *) die "GREMVM_REQUIRE_APPLICATION_FIREWALL must be true or false" ;;
-    esac
-    [ "$GREMVM_GUEST_ADMIN_USER" = lume ] || die "Lume unattended setup requires GREMVM_GUEST_ADMIN_USER=lume"
 }
 
 lume() {
     [ -x "$GREMVM_LUME_BIN" ] || die "Lume is not installed; run '$PROGRAM install'"
-    LUME_LOG_LEVEL=${LUME_LOG_LEVEL:-error} LUME_TELEMETRY_ENABLED=false "$GREMVM_LUME_BIN" "$@"
+    LUME_LOG_LEVEL=error LUME_TELEMETRY_ENABLED=false "$GREMVM_LUME_BIN" "$@"
 }
 
 service_target() {
@@ -276,36 +169,15 @@ activate_lume_release() {
     verify_lume_bundle "$runtime_dir/current" || die "activated Lume runtime failed verification"
 }
 
-write_default_config() {
+prepare_runtime_paths() {
     storage_created=false
     if [ ! -d "$GREMVM_VM_STORAGE" ]; then
         mkdir -p "$GREMVM_VM_STORAGE"
         storage_created=true
     fi
-    mkdir -p "$GREMVM_ROOT/config" "$GREMVM_LOG_DIR" "$GREMVM_STATE_DIR" "$GREMVM_SSH_DIR"
-    chmod 700 "$GREMVM_ROOT" "$GREMVM_ROOT/config" "$GREMVM_LOG_DIR" "$GREMVM_STATE_DIR" "$GREMVM_SSH_DIR"
+    mkdir -p "$GREMVM_LOG_DIR" "$GREMVM_STATE_DIR" "$GREMVM_SSH_DIR"
+    chmod 700 "$GREMVM_ROOT" "$GREMVM_LOG_DIR" "$GREMVM_STATE_DIR" "$GREMVM_SSH_DIR"
     [ "$storage_created" = false ] || chmod 700 "$GREMVM_VM_STORAGE"
-    load_config
-    if [ ! -e "$CONFIG_PATH" ]; then
-        config_tmp=$GREMVM_ROOT/config/.gremvm.env.$$
-        umask 077
-        {
-            printf '# GremVM deployment configuration.\n'
-            printf 'GREMVM_VM_NAME=%s\n' "$GREMVM_VM_NAME"
-            printf "GREMVM_VM_STORAGE='%s'\n" "$(printf '%s' "$GREMVM_VM_STORAGE" | /usr/bin/sed "s/'/'\\\\''/g")"
-            printf 'GREMVM_CPU_COUNT=%s\n' "$GREMVM_CPU_COUNT"
-            printf 'GREMVM_MEMORY=%s\n' "$GREMVM_MEMORY"
-            printf 'GREMVM_DISK_SIZE=%s\n' "$GREMVM_DISK_SIZE"
-            printf 'GREMVM_DISPLAY=%s\n' "$GREMVM_DISPLAY"
-            printf "GREMVM_IPSW='%s'\n" "$(printf '%s' "$GREMVM_IPSW" | /usr/bin/sed "s/'/'\\\\''/g")"
-            printf 'GREMVM_GUEST_ADMIN_USER=%s\n' "$GREMVM_GUEST_ADMIN_USER"
-            printf 'GREMVM_SHUTDOWN_TIMEOUT=%s\n' "$GREMVM_SHUTDOWN_TIMEOUT"
-            printf 'GREMVM_SHUTDOWN_SETTLE_SECONDS=%s\n' "$GREMVM_SHUTDOWN_SETTLE_SECONDS"
-            printf 'GREMVM_REQUIRE_APPLICATION_FIREWALL=%s\n' "$GREMVM_REQUIRE_APPLICATION_FIREWALL"
-        } > "$config_tmp"
-        chmod 600 "$config_tmp"
-        /bin/mv "$config_tmp" "$CONFIG_PATH"
-    fi
 }
 
 write_launch_agent() {
@@ -318,7 +190,6 @@ write_launch_agent() {
     cli_path=$GREMVM_ROOT/bin/gremvm
     cli_xml=$(printf '%s' "$cli_path" | xml_escape)
     home_xml=$(printf '%s' "$HOME" | xml_escape)
-    root_xml=$(printf '%s' "$GREMVM_ROOT" | xml_escape)
     ready_xml=$(printf '%s' "$GREMVM_STATE_DIR/READY" | xml_escape)
     exit_timeout=$((GREMVM_SHUTDOWN_TIMEOUT + GREMVM_SHUTDOWN_SETTLE_SECONDS + 60))
     /usr/bin/plutil -create xml1 "$plist_tmp"
@@ -332,7 +203,7 @@ write_launch_agent() {
     /usr/bin/plutil -insert WorkingDirectory -string "$HOME" "$plist_tmp"
     /usr/bin/plutil -insert StandardOutPath -string "$GREMVM_LOG_DIR/vm.log" "$plist_tmp"
     /usr/bin/plutil -insert StandardErrorPath -string "$GREMVM_LOG_DIR/vm.error.log" "$plist_tmp"
-    /usr/bin/plutil -insert EnvironmentVariables -xml "<dict><key>HOME</key><string>$home_xml</string><key>GREMVM_ROOT</key><string>$root_xml</string><key>LUME_TELEMETRY_ENABLED</key><string>false</string><key>PATH</key><string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string></dict>" "$plist_tmp"
+    /usr/bin/plutil -insert EnvironmentVariables -xml "<dict><key>HOME</key><string>$home_xml</string><key>PATH</key><string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string></dict>" "$plist_tmp"
     /usr/bin/plutil -lint "$plist_tmp" > /dev/null
     chmod 644 "$plist_tmp"
     /bin/mv "$plist_tmp" "$GREMVM_LAUNCH_AGENT"
@@ -340,8 +211,7 @@ write_launch_agent() {
 
 firewall_ok() {
     load_release
-    load_config
-    [ "$GREMVM_REQUIRE_APPLICATION_FIREWALL" = true ] || return 0
+    validate_deployment
     firewall=/usr/libexec/ApplicationFirewall/socketfilterfw
     [ -x "$firewall" ] || return 1
     global=$($firewall --getglobalstate 2> /dev/null || true)
@@ -358,10 +228,6 @@ firewall_ok() {
 }
 
 configure_firewall() {
-    if [ "$GREMVM_REQUIRE_APPLICATION_FIREWALL" != true ]; then
-        note "WARNING: GREMVM_REQUIRE_APPLICATION_FIREWALL=false; Lume's VNC listener is not host-firewall-gated." >&2
-        return 0
-    fi
     firewall=/usr/libexec/ApplicationFirewall/socketfilterfw
     [ -x "$firewall" ] || die "macOS Application Firewall control tool is unavailable"
     global=$($firewall --getglobalstate 2> /dev/null || true)
@@ -378,48 +244,13 @@ configure_firewall() {
     firewall_ok || die "the deny-inbound Lume firewall rule could not be verified"
 }
 
-firewall_check_command() {
-    load_config
-    if [ "$GREMVM_REQUIRE_APPLICATION_FIREWALL" = false ]; then
-        note "firewall: enforcement-explicitly-disabled"
-        return 0
-    fi
-    if firewall_ok; then
-        note "firewall: enabled-and-lume-blocked"
-    else
-        note "firewall: unsafe-or-unverified"
-        return 1
-    fi
-}
-
 require_qualified_host() {
     host_version=$(/usr/bin/sw_vers -productVersion) || die "could not determine the host macOS version"
     host_major=${host_version%%.*}
     case $host_major in
         '' | *[!0-9]*) die "unrecognized host macOS version: $host_version" ;;
     esac
-    [ "$host_major" -ge 26 ] ||
-        die "this deployment requires macOS 26 or newer because Lume 0.4.0 verifies unattended Recovery/SIP only for a Tahoe guest"
-}
-
-validate_guest_source() {
-    require_qualified_host
-    host_version=$(/usr/bin/sw_vers -productVersion)
-    host_major=${host_version%%.*}
-    if [ "$GREMVM_IPSW" = latest ]; then
-        [ "$host_major" -eq 26 ] ||
-            die "GREMVM_IPSW=latest is qualified only on a macOS 26 host; configure an absolute, reviewed macOS 26 (Tahoe) IPSW path"
-        return 0
-    fi
-    [ -f "$GREMVM_IPSW" ] || die "configured IPSW does not exist: $GREMVM_IPSW"
-    ipsw_version=$(
-        /usr/bin/unzip -p "$GREMVM_IPSW" BuildManifest.plist 2> /dev/null |
-            /usr/bin/plutil -extract ProductVersion raw -o - - 2> /dev/null
-    ) || die "could not read ProductVersion from configured IPSW: $GREMVM_IPSW"
-    case $ipsw_version in
-        26.*) ;;
-        *) die "Lume 0.4.0's qualified SIP workflow requires a macOS 26 (Tahoe) IPSW, not $ipsw_version" ;;
-    esac
+    [ "$host_major" -eq 26 ] || die "this minimal Lume deployment supports a macOS 26 (Tahoe) host only"
 }
 
 install_command() {
@@ -427,8 +258,8 @@ install_command() {
     [ "$(uname -m)" = arm64 ] || die "Lume requires an Apple-silicon Mac"
     require_qualified_host
     load_release
-    load_config
-    write_default_config
+    validate_deployment
+    prepare_runtime_paths
     prepare_lume_release
     configure_firewall
 
@@ -446,7 +277,6 @@ install_command() {
     /usr/bin/install -m 600 "$VERSIONS_FILE" "$GREMVM_ROOT/versions/lume.env"
 
     activate_lume_release
-    GREMVM_LUME_BIN=$GREMVM_ROOT/runtime/current/lume.app/Contents/MacOS/lume
     LUME_TELEMETRY_ENABLED=false "$GREMVM_LUME_BIN" config telemetry disable > /dev/null
     write_launch_agent
 
@@ -753,7 +583,7 @@ verify_shutdown_access() (
 
 provision_command() {
     load_release
-    load_config
+    validate_deployment
     [ -x "$GREMVM_LUME_BIN" ] || die "run '$PROGRAM install' first"
     firewall_ok || die "Lume's inbound firewall block is missing; rerun '$PROGRAM install'"
     require_command vncdo
@@ -761,7 +591,7 @@ provision_command() {
         state=$(provision_state)
         case $state in
             absent)
-                validate_guest_source
+                require_qualified_host
                 make_shutdown_key true
                 write_provision_state creating
                 ;;
@@ -775,11 +605,11 @@ provision_command() {
                     write_provision_state created
                 else
                     unattended=$(write_unattended_config)
-                    validate_guest_source
+                    require_qualified_host
                     note "Creating a vanilla macOS VM from Apple's current supported restore image. This can take a while."
                     lume create "$GREMVM_VM_NAME" \
                         --os macOS \
-                        --ipsw "$GREMVM_IPSW" \
+                        --ipsw latest \
                         --unattended "$unattended" \
                         --cpu "$GREMVM_CPU_COUNT" \
                         --memory "$GREMVM_MEMORY" \
@@ -795,7 +625,7 @@ provision_command() {
                 note "Disabling SIP through the VM's paired Recovery environment..."
                 printf 'lume\n' | lume sip off "$GREMVM_VM_NAME" \
                     --yes \
-                    --admin-user lume \
+                    --admin-user "$GREMVM_GUEST_ADMIN_USER" \
                     --admin-password-stdin \
                     --storage "$GREMVM_VM_STORAGE"
                 write_provision_state sip-disabled
@@ -803,7 +633,6 @@ provision_command() {
             sip-disabled)
                 make_shutdown_key false
                 verify_shutdown_access
-                printf '%s\n' 'Change the default guest password before installing remote access.' > "$GREMVM_STATE_DIR/NEEDS-GUEST-HARDENING"
                 /bin/rm -f "$GREMVM_STATE_DIR/unattended.yml"
                 write_provision_state ready
                 ;;
@@ -828,7 +657,7 @@ provision_command() {
 
 start_command() {
     load_release
-    load_config
+    validate_deployment
     [ -r "$GREMVM_LAUNCH_AGENT" ] || die "not installed; run '$PROGRAM install'"
     state=$(provision_state)
     [ "$state" = ready ] || die "VM '$GREMVM_VM_NAME' is not ready (provision-state: $state)"
@@ -844,7 +673,7 @@ start_command() {
 }
 
 stop_command() {
-    load_config
+    validate_deployment
     ! maintenance_active || die "a backup or lifecycle maintenance operation is active"
     if service_loaded; then
         last_stop=$GREMVM_STATE_DIR/last-stop
@@ -877,7 +706,7 @@ restart_command() {
 
 status_command() {
     load_release
-    load_config
+    validate_deployment
     if [ ! -x "$GREMVM_LUME_BIN" ]; then
         note "state: not-installed"
         return 0
@@ -915,63 +744,26 @@ status_command() {
     note "vm: $GREMVM_VM_NAME"
     note "lume: $LUME_VERSION"
     note "storage: $GREMVM_VM_STORAGE"
-    if [ "$GREMVM_REQUIRE_APPLICATION_FIREWALL" = false ]; then
-        note "firewall: enforcement-explicitly-disabled"
-    elif firewall_ok; then
+    note "sip: disabled"
+    if firewall_ok; then
         note "firewall: enabled-and-lume-blocked"
     else
         note "firewall: unsafe-or-unverified"
     fi
     ip=$(vm_field ipAddress 2> /dev/null || true)
     [ -z "$ip" ] || note "guest-ip: $ip"
-    if [ -e "$GREMVM_STATE_DIR/NEEDS-GUEST-HARDENING" ]; then
-        note "security: change the default guest password before remote use"
-    fi
+    note "security: verify that the initial lume/lume guest password was changed before remote use"
 }
 
 logs_command() {
-    load_config
-    lines=200
-    follow=false
-    while [ "$#" -gt 0 ]; do
-        case $1 in
-            --follow | -f) follow=true ;;
-            --lines)
-                shift
-                [ "$#" -gt 0 ] || die "--lines requires a number"
-                lines=$1
-                ;;
-            *) die "unknown logs option: $1" ;;
-        esac
-        shift
-    done
-    case $lines in
-        '' | *[!0-9]*) die "--lines must be a non-negative integer" ;;
-    esac
+    validate_deployment
+    [ "$#" -eq 0 ] || die "usage: $PROGRAM logs"
     [ -e "$GREMVM_LOG_DIR/vm.log" ] || die "no logs yet; run '$PROGRAM install'"
-    if [ "$follow" = true ]; then
-        /usr/bin/tail -n "$lines" -F "$GREMVM_LOG_DIR/vm.log" "$GREMVM_LOG_DIR/vm.error.log"
-    else
-        /usr/bin/tail -n "$lines" "$GREMVM_LOG_DIR/vm.log" "$GREMVM_LOG_DIR/vm.error.log"
-    fi
-}
-
-runtime_path_command() {
-    load_config
-    [ -x "$GREMVM_LUME_BIN" ] || die "Lume is not installed; run '$PROGRAM install'"
-    printf '%s\n' "$GREMVM_LUME_BIN"
-}
-
-acknowledge_hardening_command() {
-    load_config
-    [ "${1:-}" = --confirm ] && [ "$#" -eq 1 ] || die "usage: $PROGRAM acknowledge-hardening --confirm"
-    [ "$(provision_state)" = ready ] || die "VM provisioning is not complete"
-    /bin/rm -f "$GREMVM_STATE_DIR/NEEDS-GUEST-HARDENING"
-    note "Guest hardening acknowledgement recorded."
+    /usr/bin/tail -n 200 "$GREMVM_LOG_DIR/vm.log" "$GREMVM_LOG_DIR/vm.error.log"
 }
 
 console_command() {
-    load_config
+    validate_deployment
     if ! service_loaded; then
         start_command
     fi
@@ -986,33 +778,6 @@ console_command() {
         elapsed=$((elapsed + 3))
     done
     die "the VM console did not become available; inspect '$PROGRAM logs'"
-}
-
-sip_off_command() {
-    load_release
-    load_config
-    require_command vncdo
-    [ "$(provision_state)" = ready ] || die "SIP changes are allowed only for the managed, fully provisioned VM"
-    firewall_ok || die "Lume's inbound firewall block is missing; rerun '$PROGRAM install'"
-    restart_after=false
-    if service_loaded; then
-        restart_after=true
-        stop_command
-    fi
-    note "Enter the current '$GREMVM_GUEST_ADMIN_USER' guest password. Lume accepts it on stdin, not in process arguments."
-    if ! lume sip off "$GREMVM_VM_NAME" \
-        --yes \
-        --admin-user "$GREMVM_GUEST_ADMIN_USER" \
-        --admin-password-stdin \
-        --storage "$GREMVM_VM_STORAGE"; then
-        if [ "$restart_after" = true ]; then
-            start_command
-        fi
-        die "Lume did not complete the SIP-disable workflow"
-    fi
-    if [ "$restart_after" = true ]; then
-        start_command
-    fi
 }
 
 same_device() {
@@ -1061,7 +826,7 @@ wait_for_runner_exit() {
 }
 
 run_locked() {
-    load_config
+    validate_deployment
     acquire_maintenance_lock
     trap release_maintenance_lock EXIT
     trap 'exit 129' HUP
@@ -1074,24 +839,9 @@ run_locked() {
 
 backup_command() {
     load_release
-    load_config
-    destination=
-    while [ "$#" -gt 0 ]; do
-        case $1 in
-            --destination)
-                shift
-                [ "$#" -gt 0 ] || die "--destination requires an absolute path"
-                destination=$1
-                ;;
-            *) die "unknown backup option: $1" ;;
-        esac
-        shift
-    done
-    [ -n "$destination" ] || die "usage: $PROGRAM backup --destination /Volumes/EncryptedBackup/lume"
-    case $destination in
-        /*) ;;
-        *) die "backup destination must be an absolute path" ;;
-    esac
+    validate_deployment
+    [ "$#" -eq 0 ] || die "usage: $PROGRAM backup"
+    destination=$GREMVM_BACKUP_DESTINATION
     [ -d "$destination" ] || die "backup destination must already exist: $destination"
     [ ! -L "$destination" ] || die "backup destination may not be a symbolic link"
     [ -w "$destination" ] || die "backup destination is not writable: $destination"
@@ -1196,13 +946,14 @@ uninstall_preserves_vm() {
         if [ -d "$removal" ]; then
             removal=$(CDPATH='' cd -- "$removal" && pwd -P)
         fi
-        paths_overlap "$vm_dir" "$removal" &&
+        if paths_overlap "$vm_dir" "$removal"; then
             die "refusing to uninstall because runtime removal overlaps VM data: $vm_dir"
+        fi
     done
 }
 
 uninstall_command() {
-    load_config
+    validate_deployment
     uninstall_preserves_vm
     if service_loaded; then
         stop_command
@@ -1221,12 +972,12 @@ uninstall_command() {
         fi
     done
     note "Uninstalled the launch agent and deployment runtime."
-    note "Preserved VM data, configuration, shutdown keys, logs, and all external backups under $GREMVM_ROOT and $GREMVM_VM_STORAGE."
+    note "Preserved VM data, shutdown keys, logs, and all external backups under $GREMVM_ROOT and $GREMVM_VM_STORAGE."
 }
 
 internal_supervise() {
     load_release
-    load_config
+    validate_deployment
     firewall_ok || die "Lume's inbound firewall block is missing; refusing to start the VM"
     ! maintenance_active || die "a backup or lifecycle maintenance operation is active"
     state=$(provision_state)
@@ -1289,17 +1040,12 @@ Usage: $PROGRAM COMMAND
 
 Commands:
   install                         Install pinned Lume and login-time launchd wiring
-  provision                       Create the VM, disable SIP, and verify shutdown access
+  provision                       Create the Tahoe VM, disable SIP, and verify shutdown access
   status                          Show the deployment lifecycle state
   start | stop | restart          Control the VM supervisor
   console                         Open the local VM console
-  sip-off                         Re-run Lume's Recovery SIP-disable workflow
-  firewall-check                  Verify the required deny-inbound Lume rule
-  runtime-path                    Print the pinned Lume executable path
-  acknowledge-hardening --confirm
-                                  Clear the post-provision security reminder
-  logs [--follow] [--lines N]     Read supervisor logs
-  backup --destination PATH       Create a stopped clone on another mounted volume
+  logs                            Read the most recent 200 supervisor log lines
+  backup                          Clone to /Volumes/GremVM Backup/lume
   uninstall                       Remove code and launchd wiring; preserve all data
 EOF
 }
@@ -1307,21 +1053,44 @@ EOF
 command=${1:-help}
 [ "$#" -eq 0 ] || shift
 case $command in
-    install) run_locked install_command "$@" ;;
-    provision) run_locked provision_command "$@" ;;
-    status) status_command "$@" ;;
-    start) run_locked start_command "$@" ;;
-    stop) run_locked stop_command "$@" ;;
-    restart) run_locked restart_command "$@" ;;
-    console) run_locked console_command "$@" ;;
-    sip-off) run_locked sip_off_command "$@" ;;
-    firewall-check) firewall_check_command "$@" ;;
-    runtime-path) runtime_path_command "$@" ;;
-    acknowledge-hardening) run_locked acknowledge_hardening_command "$@" ;;
+    install)
+        [ "$#" -eq 0 ] || die "usage: $PROGRAM install"
+        run_locked install_command
+        ;;
+    provision)
+        [ "$#" -eq 0 ] || die "usage: $PROGRAM provision"
+        run_locked provision_command
+        ;;
+    status)
+        [ "$#" -eq 0 ] || die "usage: $PROGRAM status"
+        status_command
+        ;;
+    start)
+        [ "$#" -eq 0 ] || die "usage: $PROGRAM start"
+        run_locked start_command
+        ;;
+    stop)
+        [ "$#" -eq 0 ] || die "usage: $PROGRAM stop"
+        run_locked stop_command
+        ;;
+    restart)
+        [ "$#" -eq 0 ] || die "usage: $PROGRAM restart"
+        run_locked restart_command
+        ;;
+    console)
+        [ "$#" -eq 0 ] || die "usage: $PROGRAM console"
+        run_locked console_command
+        ;;
     logs) logs_command "$@" ;;
     backup) backup_command "$@" ;;
-    uninstall) run_locked uninstall_command "$@" ;;
-    internal-supervise) internal_supervise "$@" ;;
+    uninstall)
+        [ "$#" -eq 0 ] || die "usage: $PROGRAM uninstall"
+        run_locked uninstall_command
+        ;;
+    internal-supervise)
+        [ "$#" -eq 0 ] || die "internal supervisor takes no arguments"
+        internal_supervise
+        ;;
     help | --help | -h) usage ;;
     *)
         usage >&2
