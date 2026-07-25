@@ -41,21 +41,25 @@
         system:
         let
           pkgs = pkgsFor system;
+          developmentTools = [
+            pkgs.bats
+            pkgs.cloudflared
+            pkgs.curl
+            pkgs.jq
+            pkgs.nixfmt
+            pkgs.openssl
+            pkgs.restic
+            pkgs.shellcheck
+            pkgs.shfmt
+            keytap.packages.${system}.default
+          ];
         in
         {
           default = pkgs.mkShellNoCC {
-            packages = [
-              pkgs.bats
-              pkgs.cloudflared
-              pkgs.curl
-              pkgs.jq
-              pkgs.nixfmt
-              pkgs.openssl
-              pkgs.restic
-              pkgs.shellcheck
-              pkgs.shfmt
-              keytap.packages.${system}.default
-            ];
+            packages = developmentTools;
+          };
+          cloudflare = pkgs.mkShellNoCC {
+            packages = developmentTools ++ [ pkgs.wrangler ];
           };
         }
       );
