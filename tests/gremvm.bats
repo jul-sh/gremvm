@@ -130,15 +130,6 @@ teardown() {
     [ "$status" -eq 0 ]
 }
 
-@test "Cloudflare setup supports explicit Wrangler OAuth account authentication" {
-    run grep -F 'GREMVM_CLOUDFLARE_AUTH' "$REPO_ROOT/scripts/cloudflare-setup.sh" "$REPO_ROOT/README.md" "$REPO_ROOT/docs/REMOTE_ACCESS.md"
-    [ "$status" -eq 0 ] || return 1
-    run grep -F 'wrangler auth token --json' "$REPO_ROOT/scripts/cloudflare-setup.sh"
-    [ "$status" -eq 0 ]
-    run grep -F 'wrangler logout' "$REPO_ROOT/scripts/cloudflare-setup-wrangler.sh"
-    [ "$status" -eq 0 ]
-}
-
 @test "supervisor routes only SSH to the private Tart guest and stops tunnel first" {
     run grep -F 'find_ssh 30' "$REPO_ROOT/bin/gremvm"
     [ "$status" -eq 0 ] || return 1
@@ -164,7 +155,7 @@ teardown() {
     [ ! -e "$REPO_ROOT/remote" ] || [ -z "$(find "$REPO_ROOT/remote" -type f -print)" ] || return 1
     [ ! -e "$REPO_ROOT/versions/remote.env" ] || return 1
     [ ! -e "$REPO_ROOT/scripts/remote-url.sh" ] || return 1
-    run grep -E -i 'webrtc|turn_keys|novnc|pion|durable object|tailscale' \
+    run grep -E -i 'webrtc|turn_keys|novnc|pion|durable object|wrangler|tailscale' \
         "$REPO_ROOT/bin/gremvm" "$REPO_ROOT/flake.nix" "$REPO_ROOT"/scripts/*.sh
     [ "$status" -eq 1 ] || return 1
     [ -z "$output" ] || return 1

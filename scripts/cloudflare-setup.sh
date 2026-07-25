@@ -13,7 +13,6 @@ tunnel_name=gremvm
 app_name='GremVM SSH'
 policy_name='GremVM owner'
 access_email=${GREMVM_CLOUDFLARE_ACCESS_EMAIL:-}
-auth_mode=${GREMVM_CLOUDFLARE_AUTH:-keytap}
 
 die() {
     echo "$program: $*" >&2
@@ -25,26 +24,14 @@ mode=${1:-}
 if [ "$#" -ne 1 ] || { [ "$mode" != check ] && [ "$mode" != apply ]; }; then
     die "usage: GREMVM_CLOUDFLARE_ACCESS_EMAIL=you@example.com $program check|apply"
 fi
-for dependency in curl jq; do need "$dependency"; done
+for dependency in curl jq keytap; do need "$dependency"; done
 printf '%s' "$access_email" | jq -eR 'test("^[^[:space:]@]+@[^[:space:]@]+\\.[^[:space:]@]+$")' > /dev/null ||
     die "set GREMVM_CLOUDFLARE_ACCESS_EMAIL to the one identity allowed through Access"
-case $auth_mode in
-    keytap)
-        need keytap
-        [ -r "$api_secret" ] || die "missing encrypted API token: $api_secret"
-        [ "$(LC_ALL=C /usr/bin/grep -a -c '^-> ' "$api_secret")" -eq 1 ] || die "API token must have exactly one Keytap recipient"
-        api_token=$(keytap decrypt keytap < "$api_secret")
-        [ -n "$api_token" ] || die "Cloudflare API token decrypted to an empty value"
-        ;;
-    wrangler)
-        need wrangler
-        api_token=$(wrangler auth token --json | jq -er '
-            select(.type == "oauth") |
-            .token | select(type == "string" and length > 0)
-        ') || die "Wrangler is not logged in; run 'wrangler login --use-keyring' first"
-        ;;
-    *) die "GREMVM_CLOUDFLARE_AUTH must be keytap or wrangler" ;;
-esac
+[ -r "$api_secret" ] || die "missing encrypted API token: $api_secret"
+[ "$(LC_ALL=C /usr/bin/grep -a -c '^-> ' "$api_secret")" -eq 1 ] || die "API token must have exactly one Keytap recipient"
+
+api_token=$(keytap decrypt keytap < "$api_secret")
+[ -n "$api_token" ] || die "Cloudflare API token decrypted to an empty value"
 trap 'unset api_token credentials response tunnel_material' EXIT HUP INT TERM
 
 cf() {
