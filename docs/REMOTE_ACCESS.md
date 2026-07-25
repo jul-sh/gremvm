@@ -41,20 +41,18 @@ deleting them.
 
 By default the script obtains its account API token from the Keytap-only
 envelope. A trusted administrator can instead use Wrangler's interactive OAuth
-login for this one-time account reconciliation:
+login for this one-time account reconciliation. The helper uses a private
+temporary home, revokes its OAuth credential when finished, and does not write
+it to the administrator's usual user profile:
 
 ```sh
-nix develop path:.#cloudflare -c wrangler login --use-keyring
-GREMVM_CLOUDFLARE_AUTH=wrangler \
-  GREMVM_CLOUDFLARE_ACCESS_EMAIL='j@jul.sh' \
-  nix develop path:.#cloudflare -c ./scripts/cloudflare-setup.sh check
-GREMVM_CLOUDFLARE_AUTH=wrangler \
-  GREMVM_CLOUDFLARE_ACCESS_EMAIL='j@jul.sh' \
-  nix develop path:.#cloudflare -c ./scripts/cloudflare-setup.sh apply
+GREMVM_CLOUDFLARE_ACCESS_EMAIL='j@jul.sh' \
+  nix develop path:.#cloudflare -c ./scripts/cloudflare-setup-wrangler.sh check
+GREMVM_CLOUDFLARE_ACCESS_EMAIL='j@jul.sh' \
+  nix develop path:.#cloudflare -c ./scripts/cloudflare-setup-wrangler.sh apply
 ```
 
-Wrangler stores its OAuth state in the administrator's macOS Keychain. It is
-not part of the GremVM host runtime; the Tunnel recovery envelope remains
+It is not part of the GremVM host runtime; the Tunnel recovery envelope remains
 Keytap-only.
 
 The API token needs:

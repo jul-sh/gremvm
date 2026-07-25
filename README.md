@@ -117,18 +117,15 @@ check before `apply` mutates anything. Runtime keeps only a tunnel-specific
 credential; the account API token is never installed into the host service.
 
 On a trusted administrative Mac, the same reconciliation can use an interactive
-Wrangler OAuth login rather than decrypting the source API token. Wrangler
-stores that one-time administrator credential in the macOS Keychain; it is not
-used by the unattended service or committed to this repository:
+Wrangler OAuth login rather than decrypting the source API token. The helper
+uses a private temporary home, revokes the temporary Wrangler credential when
+finished, and does not write an OAuth credential to your usual user profile:
 
 ```sh
-nix develop path:.#cloudflare -c wrangler login --use-keyring
-GREMVM_CLOUDFLARE_AUTH=wrangler \
-  GREMVM_CLOUDFLARE_ACCESS_EMAIL='j@jul.sh' \
-  nix develop path:.#cloudflare -c ./scripts/cloudflare-setup.sh check
-GREMVM_CLOUDFLARE_AUTH=wrangler \
-  GREMVM_CLOUDFLARE_ACCESS_EMAIL='j@jul.sh' \
-  nix develop path:.#cloudflare -c ./scripts/cloudflare-setup.sh apply
+GREMVM_CLOUDFLARE_ACCESS_EMAIL='j@jul.sh' \
+  nix develop path:.#cloudflare -c ./scripts/cloudflare-setup-wrangler.sh check
+GREMVM_CLOUDFLARE_ACCESS_EMAIL='j@jul.sh' \
+  nix develop path:.#cloudflare -c ./scripts/cloudflare-setup-wrangler.sh apply
 ```
 
 On the client, install `cloudflared` and add:

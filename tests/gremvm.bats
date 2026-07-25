@@ -135,6 +135,8 @@ teardown() {
     [ "$status" -eq 0 ] || return 1
     run grep -F 'wrangler auth token --json' "$REPO_ROOT/scripts/cloudflare-setup.sh"
     [ "$status" -eq 0 ]
+    run grep -F 'wrangler logout' "$REPO_ROOT/scripts/cloudflare-setup-wrangler.sh"
+    [ "$status" -eq 0 ]
 }
 
 @test "supervisor routes only SSH to the private Tart guest and stops tunnel first" {
