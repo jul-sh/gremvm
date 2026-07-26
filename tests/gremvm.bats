@@ -42,19 +42,11 @@ setup() {
     [ "$status" -ne 0 ]
 }
 
-@test "host macOS release is not pinned" {
-    run grep -E 'require_tahoe_host|macOS 26 \(Tahoe\) host' "$REPO_ROOT/bin/gremvm"
+@test "restore-image support is delegated to Lume" {
+    run grep -E 'sw_vers|require_tahoe_host|host_macos_version|unattended_preset|macOS 26 \(Tahoe\) host' "$REPO_ROOT/bin/gremvm"
     [ "$status" -ne 0 ]
-}
 
-@test "older hosts use the Sequoia unattended fallback" {
-    run env HOME="$TEST_HOME" sh -c '
-        . "$1" --help >/dev/null
-        host_macos_version() { printf "15.7\n"; }
-        [ "$(unattended_preset)" = sequoia ]
-        host_macos_version() { printf "26.0\n"; }
-        [ "$(unattended_preset)" = tahoe ]
-    ' sh "$REPO_ROOT/bin/gremvm"
+    run grep -F 'lume create "$VM_NAME" --ipsw latest --unattended tahoe' "$REPO_ROOT/bin/gremvm"
     [ "$status" -eq 0 ]
 }
 
