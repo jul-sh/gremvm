@@ -42,6 +42,11 @@ setup() {
     [ "$status" -ne 0 ]
 }
 
+@test "host macOS release is not pinned" {
+    run grep -E 'sw_vers|require_tahoe_host|macOS 26 \(Tahoe\) host' "$REPO_ROOT/bin/gremvm"
+    [ "$status" -ne 0 ]
+}
+
 @test "no personal signing material remains in the deployment repo" {
     run find "$REPO_ROOT" -path "$REPO_ROOT/.git" -prune -o -type f \( -name '*.p8' -o -name '*.p12' -o -name '*.age.b64' \) -print
     [ "$status" -eq 0 ]

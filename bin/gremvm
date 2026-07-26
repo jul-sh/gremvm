@@ -221,15 +221,6 @@ configure_firewall() {
     firewall_ok || die "the deny-inbound Lume firewall rule could not be verified"
 }
 
-require_tahoe_host() {
-    host_version=$(/usr/bin/sw_vers -productVersion) || die "could not determine the host macOS version"
-    host_major=${host_version%%.*}
-    case $host_major in
-        26) ;;
-        *) die "this minimal Lume deployment supports a macOS 26 (Tahoe) host only" ;;
-    esac
-}
-
 write_provision_state() {
     next_state=$1
     case $next_state in
@@ -273,7 +264,6 @@ provision_state() {
 install_command() {
     [ "$(uname -s)" = Darwin ] || die "the host must be macOS"
     [ "$(uname -m)" = arm64 ] || die "Lume requires an Apple-silicon Mac"
-    require_tahoe_host
     load_release
     prepare_runtime_paths
 
@@ -304,7 +294,6 @@ provision_command() {
     validate_deployment
     [ -x "$LUME_BIN" ] || die "run '$PROGRAM install' first"
     firewall_ok || die "Lume's inbound firewall block is missing; rerun '$PROGRAM install'"
-    require_tahoe_host
     require_command vncdo
 
     while :; do
