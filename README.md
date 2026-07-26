@@ -13,7 +13,7 @@ There is no remote-access setup, guest-management layer, backup implementation, 
 
 ## Requirements
 
-Use an Apple-silicon Mac supported by the pinned Lume release. GremVM uses Lume's Tahoe unattended setup on macOS 26 or newer and its Sequoia fallback on older hosts. Lume asks Apple for the newest restore image supported by that host.
+Use an Apple-silicon Mac supported by the pinned Lume release. GremVM does not map host versions to guest versions; Lume chooses a restore image supported by the host.
 
 The VM starts after the owning host account signs in. GremVM never changes FileVault or automatic-login settings. Consequently, after a cold boot with FileVault enabled, someone must unlock the Mac and sign in; with no signed-in owner, the VM remains stopped.
 

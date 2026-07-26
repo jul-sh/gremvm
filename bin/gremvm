@@ -221,20 +221,6 @@ configure_firewall() {
     firewall_ok || die "the deny-inbound Lume firewall rule could not be verified"
 }
 
-host_macos_version() {
-    /usr/bin/sw_vers -productVersion
-}
-
-unattended_preset() {
-    version=$(host_macos_version) || die "could not determine the host macOS version"
-    major=${version%%.*}
-    case $major in
-        '' | *[!0-9]*) die "invalid host macOS version: $version" ;;
-        1[0-9] | 2[0-5]) printf '%s\n' sequoia ;;
-        *) printf '%s\n' tahoe ;;
-    esac
-}
-
 write_provision_state() {
     next_state=$1
     case $next_state in
@@ -323,9 +309,8 @@ provision_command() {
                             die "Lume creation was interrupted before $required existed; partial VM data was preserved for inspection"
                     done
                 else
-                    preset=$(unattended_preset)
-                    note "Creating the VM with Lume's $preset unattended preset..."
-                    lume create "$VM_NAME" --ipsw latest --unattended "$preset" --storage "$VM_STORAGE"
+                    note "Creating the VM with Lume..."
+                    lume create "$VM_NAME" --ipsw latest --unattended tahoe --storage "$VM_STORAGE"
                 fi
                 write_provision_state created
                 ;;
