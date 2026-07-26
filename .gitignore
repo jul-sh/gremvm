@@ -2,21 +2,7 @@
 .DS_Store
 result
 result-*
-.build/
 
 # Local deployment state and credentials never belong in this repository.
 .gremvm/
 *.plaintext
-*.age.b64
-*.cer
-*.key
-*.mobileprovision
-*.p8
-*.p12
-*.pem
-*.pfx
-*.provisionprofile
-
-# Large local Tart inputs and exports are deployment artifacts, not source.
-*.ipsw
-*.tvm

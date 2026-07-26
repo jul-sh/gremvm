@@ -1,717 +1,590 @@
 #!/bin/sh
+
 set -eu
 umask 077
 
 PROGRAM=${0##*/}
-LABEL=io.gremvm.tart
-SSH_HOSTNAME=gremvm.eviljuliette.com
+LABEL=io.gremvm.lume
 HOST_HOME=$HOME
 ROOT=$HOST_HOME/Library/Application\ Support/GremVM
-REQUESTED_ROOT=${GREMVM_ROOT:-$ROOT}
-CONFIG=$ROOT/config/gremvm.env
+VM_NAME=work
+VM_STORAGE=$ROOT/vms
+LUME_BIN=$ROOT/runtime/current/lume.app/Contents/MacOS/lume
+LAUNCH_AGENT=$HOST_HOME/Library/LaunchAgents/$LABEL.plist
+LOG_DIR=$ROOT/logs
+STATE_DIR=$ROOT/state
+GUEST_POLL_SECONDS=20
+GUEST_STARTUP_POLLS=30
+GUEST_FAILURE_POLLS=45
+RUNNER_STOP_POLLS=10
+RUNNER_PID=
 
-script=$0
-case $script in */*) ;; *) script=$(command -v "$script") || exit 1 ;; esac
-hops=0
-while [ -L "$script" ]; do
-    hops=$((hops + 1))
-    [ "$hops" -le 20 ] || {
-        echo "$PROGRAM: executable symlink loop" >&2
+SCRIPT_PATH=$0
+case $SCRIPT_PATH in
+    */*) ;;
+    *) SCRIPT_PATH=$(command -v "$SCRIPT_PATH") || exit 1 ;;
+esac
+symlink_hops=0
+while [ -L "$SCRIPT_PATH" ]; do
+    symlink_hops=$((symlink_hops + 1))
+    [ "$symlink_hops" -le 20 ] || {
+        printf '%s: too many executable symlinks\n' "$PROGRAM" >&2
         exit 1
     }
-    target=$(/usr/bin/readlink "$script")
-    case $target in /*) script=$target ;; *) script=$(dirname "$script")/$target ;; esac
+    link_target=$(/usr/bin/readlink "$SCRIPT_PATH") || exit 1
+    case $link_target in
+        /*) SCRIPT_PATH=$link_target ;;
+        *) SCRIPT_PATH=$(dirname -- "$SCRIPT_PATH")/$link_target ;;
+    esac
 done
-SCRIPT=$(CDPATH='' cd "$(dirname "$script")" && pwd -P)/$(basename "$script")
-REPO=$(CDPATH='' cd "$(dirname "$SCRIPT")/.." && pwd -P)
-PIN=$REPO/versions/tart.env
-CLOUDFLARED_PIN=$REPO/versions/cloudflared.env
-locked=false
-restart_on_exit=false
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd -P)
+REPO_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIR/.." && pwd -P)
+VERSIONS_FILE=$REPO_ROOT/versions/lume.env
+readonly PROGRAM LABEL HOST_HOME ROOT VM_NAME VM_STORAGE LUME_BIN LAUNCH_AGENT LOG_DIR STATE_DIR GUEST_POLL_SECONDS GUEST_STARTUP_POLLS GUEST_FAILURE_POLLS RUNNER_STOP_POLLS SCRIPT_DIR REPO_ROOT VERSIONS_FILE
 
 die() {
-    echo "$PROGRAM: $*" >&2
+    printf '%s: %s\n' "$PROGRAM" "$*" >&2
     exit 1
 }
-note() { printf '%s\n' "$*"; }
 
-load_pin() {
-    [ -r "$PIN" ] || die "missing release pin: $PIN"
+note() {
+    printf '%s\n' "$*"
+}
+
+require_command() {
+    command -v "$1" > /dev/null 2>&1 || die "required command not found: $1"
+}
+
+load_release() {
+    [ -r "$VERSIONS_FILE" ] || die "missing release pin: $VERSIONS_FILE"
+    # The release file is repository-controlled and contains assignments only.
     # shellcheck disable=SC1090
-    . "$PIN"
+    . "$VERSIONS_FILE"
 }
 
-load_cloudflared_pin() {
-    [ -r "$CLOUDFLARED_PIN" ] || die "missing cloudflared release pin: $CLOUDFLARED_PIN"
-    # shellcheck disable=SC1090
-    . "$CLOUDFLARED_PIN"
+validate_deployment() {
+    [ ! -L "$VM_STORAGE/$VM_NAME" ] || die "VM directory may not be a symbolic link"
 }
 
-positive() {
-    case $2 in '' | *[!0-9]*) die "$1 must be a positive integer" ;; esac
-    [ "$2" -gt 0 ] || die "$1 must be positive"
+lume() {
+    [ -x "$LUME_BIN" ] || die "Lume is not installed; run '$PROGRAM install'"
+    "$LUME_BIN" "$@"
 }
 
-load_config() {
-    GREMVM_VM_NAME=${GREMVM_VM_NAME:-work}
-    GREMVM_CPU_COUNT=${GREMVM_CPU_COUNT:-4}
-    GREMVM_MEMORY_MB=${GREMVM_MEMORY_MB:-8192}
-    GREMVM_DISK_SIZE_GB=${GREMVM_DISK_SIZE_GB:-150}
-    GREMVM_DISPLAY=${GREMVM_DISPLAY:-1920x1200}
-    GREMVM_IPSW=${GREMVM_IPSW:-latest}
-    GREMVM_GUEST_ADMIN_USER=${GREMVM_GUEST_ADMIN_USER:-grem}
-    GREMVM_SHUTDOWN_TIMEOUT=${GREMVM_SHUTDOWN_TIMEOUT:-90}
-    if [ -r "$CONFIG" ]; then
-        # shellcheck disable=SC1090
-        . "$CONFIG"
+service_target() {
+    printf 'gui/%s/%s\n' "$(id -u)" "$LABEL"
+}
+
+service_loaded() {
+    launchctl print "$(service_target)" > /dev/null 2>&1
+}
+
+vm_exists() {
+    lume get "$VM_NAME" --storage "$VM_STORAGE" --format json > /dev/null 2>&1
+}
+
+vm_field() {
+    field=$1
+    lume get "$VM_NAME" --storage "$VM_STORAGE" --format json 2> /dev/null |
+        /usr/bin/plutil -extract "0.$field" raw -o - - 2> /dev/null
+}
+
+xml_escape() {
+    /usr/bin/sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' -e "s/'/\&apos;/g"
+}
+
+verify_lume_bundle() {
+    release_dir=$1
+    [ -d "$release_dir/lume.app" ] || return 1
+    signed_lume=$release_dir/lume.app/Contents/MacOS/lume
+    [ -x "$signed_lume" ] || return 1
+    /usr/bin/codesign --verify --deep --strict "$release_dir/lume.app" > /dev/null 2>&1 || return 1
+    /usr/sbin/spctl --assess --type execute "$release_dir/lume.app" > /dev/null 2>&1 || return 1
+    signature=$(/usr/bin/codesign -dv --verbose=4 "$release_dir/lume.app" 2>&1) || return 1
+    team=$(printf '%s\n' "$signature" | /usr/bin/awk -F= '$1 == "TeamIdentifier" { print $2 }')
+    identifier=$(printf '%s\n' "$signature" | /usr/bin/awk -F= '$1 == "Identifier" { print $2 }')
+    [ "$team" = "$LUME_TEAM_ID" ] || return 1
+    [ "$identifier" = "$LUME_BUNDLE_ID" ] || return 1
+    printf '%s\n' "$signature" | /usr/bin/grep -Eq '^CodeDirectory .*flags=.*\(runtime\)' || return 1
+    reported=$("$signed_lume" --version 2> /dev/null) || return 1
+    [ "$reported" = "$LUME_VERSION" ]
+}
+
+prepare_lume_release() (
+    runtime_dir=$ROOT/runtime
+    release_dir=$runtime_dir/lume-$LUME_VERSION
+    mkdir -p "$runtime_dir"
+    chmod 700 "$runtime_dir"
+
+    if [ -e "$release_dir" ]; then
+        verify_lume_bundle "$release_dir" || die "existing Lume runtime failed verification: $release_dir"
+    else
+        require_command curl
+        require_command shasum
+        staging=$(mktemp -d "$runtime_dir/.install.XXXXXX")
+        archive=$staging/lume.tar.gz
+        # shellcheck disable=SC2329 # Called asynchronously by the EXIT trap below.
+        cleanup_install() {
+            /bin/rm -R "$staging"
+        }
+        trap cleanup_install EXIT
+        trap 'exit 129' HUP
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+
+        note "Downloading pinned Lume $LUME_VERSION..."
+        curl -fL --retry 3 --proto '=https' --tlsv1.2 -o "$archive" "$LUME_ARCHIVE_URL"
+        actual=$(/usr/bin/shasum -a 256 "$archive" | /usr/bin/awk '{print $1}')
+        [ "$actual" = "$LUME_ARCHIVE_SHA256" ] || die "Lume archive checksum mismatch"
+
+        mkdir "$staging/unpack"
+        /usr/bin/tar -xzf "$archive" -C "$staging/unpack"
+        verify_lume_bundle "$staging/unpack" || die "Lume signature, hardened runtime, Gatekeeper, identity, or version verification failed"
+        /bin/mv "$staging/unpack" "$release_dir"
+        trap - EXIT HUP INT TERM
+        /bin/rm -R "$staging"
     fi
-    [ "$REQUESTED_ROOT" = "$ROOT" ] || die "GREMVM_ROOT is fixed at $ROOT"
-    [ "$HOME" = "$HOST_HOME" ] || die "config may not change HOME"
-    [ "${GREMVM_ROOT:-$ROOT}" = "$ROOT" ] || die "config may not change GREMVM_ROOT"
-    [ "$ROOT" != / ] && [ -n "$HOST_HOME" ] || die "unsafe deployment root"
-    [ ! -L "$ROOT" ] || die "deployment root may not be a symlink"
-    case $ROOT in *'&'* | *'<'* | *'>'*) die "HOME contains unsupported XML characters" ;; esac
-    case $ROOT in *'"'* | *\\*) die "HOME contains unsupported configuration characters" ;; esac
-    case $GREMVM_VM_NAME in '' | [!A-Za-z0-9]* | *[!A-Za-z0-9._-]*) die "invalid VM name: $GREMVM_VM_NAME" ;; esac
-    case $GREMVM_GUEST_ADMIN_USER in '' | [!a-z_]* | *[!a-z0-9_-]*) die "invalid guest account: $GREMVM_GUEST_ADMIN_USER" ;; esac
-    positive GREMVM_CPU_COUNT "$GREMVM_CPU_COUNT"
-    positive GREMVM_MEMORY_MB "$GREMVM_MEMORY_MB"
-    positive GREMVM_DISK_SIZE_GB "$GREMVM_DISK_SIZE_GB"
-    positive GREMVM_SHUTDOWN_TIMEOUT "$GREMVM_SHUTDOWN_TIMEOUT"
-    [ "$GREMVM_SHUTDOWN_TIMEOUT" -le 600 ] || die "shutdown timeout may not exceed 600"
-    case $GREMVM_DISPLAY in *x*)
-        width=${GREMVM_DISPLAY%x*}
-        height=${GREMVM_DISPLAY#*x}
-        ;;
-    *) die "display must be WIDTHxHEIGHT" ;; esac
-    positive display-width "$width"
-    positive display-height "$height"
-    case $GREMVM_IPSW in latest | /*.ipsw) ;; *) die "IPSW must be 'latest' or an absolute .ipsw path" ;; esac
-    TART_HOME=$ROOT/tart
-    TART=$ROOT/runtime/current/tart.app/Contents/MacOS/tart
-    CLOUDFLARED=$ROOT/runtime/current-cloudflared/cloudflared
-    CLOUDFLARE_DIR=$ROOT/cloudflare
-    CLOUDFLARE_CREDENTIALS=$CLOUDFLARE_DIR/credentials.json
-    AGENT=$HOST_HOME/Library/LaunchAgents/$LABEL.plist
-    STATE=$ROOT/state
-    CLOUDFLARE_CONFIG=$STATE/cloudflared.json
-    LOGS=$ROOT/logs
-    SSH_DIR=$ROOT/ssh
-    BOOTSTRAP=$ROOT/bootstrap
-    WANTS=$STATE/WANTS-RUNNING
-    PHASE_FILE=$STATE/provision-state
-}
-
-tart() { /usr/bin/env -u TRACEPARENT TART_HOME="$TART_HOME" TART_NO_AUTO_PRUNE= "$TART" "$@"; }
-installed() { [ -x "$TART" ]; }
-require_installed() { installed || die "Tart is not installed; run '$PROGRAM install'"; }
-
-phase() {
-    [ -e "$PHASE_FILE" ] || {
-        echo absent
-        return
-    }
-    [ -f "$PHASE_FILE" ] && [ ! -L "$PHASE_FILE" ] || die "unsafe provision state"
-    value=$(/usr/bin/sed -n '1p' "$PHASE_FILE")
-    case $value in creating | needs-setup | ready) echo "$value" ;; *) die "unknown provision state: $value" ;; esac
-}
-set_phase() {
-    printf '%s\n' "$1" > "$STATE/.phase.$$"
-    /bin/mv -f "$STATE/.phase.$$" "$PHASE_FILE"
-}
-vm_exists() { tart list --source local --quiet 2> /dev/null | /usr/bin/grep -Fx "$GREMVM_VM_NAME" > /dev/null 2>&1; }
-vm_json() { tart get "$GREMVM_VM_NAME" --format json 2> /dev/null; }
-vm_state() {
-    data=$(vm_json) || {
-        echo missing
-        return
-    }
-    printf '%s' "$data" | /usr/bin/plutil -extract State raw -o - - 2> /dev/null
-}
-wait_state() {
-    wanted=$1
-    left=$2
-    while [ "$left" -gt 0 ]; do
-        [ "$(vm_state)" = "$wanted" ] && return
-        /bin/sleep 1
-        left=$((left - 1))
-    done
-    return 1
-}
-
-target() { printf 'gui/%s/%s\n' "$(/usr/bin/id -u)" "$LABEL"; }
-service_loaded() { /bin/launchctl print "$(target)" > /dev/null 2>&1; }
-service_running() { /bin/launchctl print "$(target)" 2> /dev/null | /usr/bin/grep -F 'state = running' > /dev/null 2>&1; }
-load_service() { service_loaded || /bin/launchctl bootstrap "gui/$(/usr/bin/id -u)" "$AGENT"; }
-
-lock() {
-    /bin/mkdir -p "$STATE"
-    exec 9>> "$STATE/maintenance.lock"
-    /usr/bin/lockf -s -t 0 9 || {
-        exec 9>&-
-        die "another lifecycle or backup operation is active"
-    }
-    locked=true
-}
-unlock() {
-    if [ "$restart_on_exit" = true ]; then
-        : > "$WANTS"
-        load_service && /bin/launchctl kickstart "$(target)" || true
-        restart_on_exit=false
-    fi
-    [ "$locked" = true ] || return 0
-    exec 9>&-
-    locked=false
-}
-locked_call() {
-    load_pin
-    load_config
-    lock
-    trap unlock EXIT
-    trap 'exit 143' HUP INT TERM
-    "$@"
-    trap - EXIT HUP INT TERM
-    unlock
-}
-
-verify_bundle() {
-    dir=$1
-    app=$dir/tart.app
-    bin=$app/Contents/MacOS/tart
-    [ -x "$bin" ] || return 1
-    /usr/bin/codesign --verify --deep --strict "$app" > /dev/null 2>&1 || return 1
-    /usr/sbin/spctl --assess --type execute "$app" > /dev/null 2>&1 || return 1
-    sig=$(/usr/bin/codesign -dv --verbose=4 "$app" 2>&1) || return 1
-    echo "$sig" | /usr/bin/grep -Fx "Identifier=$TART_BUNDLE_ID" > /dev/null || return 1
-    echo "$sig" | /usr/bin/grep -Fx "TeamIdentifier=$TART_TEAM_ID" > /dev/null || return 1
-    echo "$sig" | /usr/bin/grep '^flags=.*runtime' > /dev/null || return 1
-    [ "$(/usr/bin/env -u TRACEPARENT "$bin" --version 2> /dev/null)" = "$TART_VERSION" ]
-}
-
-prepare_runtime() (
-    release=$ROOT/runtime/tart-$TART_VERSION
-    if [ -d "$release" ]; then
-        verify_bundle "$release" || die "installed Tart failed verification"
-        exit
-    fi
-    tmp=$(/usr/bin/mktemp -d "$ROOT/runtime/.tart.XXXXXX")
-    trap '/bin/rm -rf "$tmp"' EXIT HUP INT TERM
-    /usr/bin/curl --fail --location --proto '=https' --tlsv1.2 "$TART_ARCHIVE_URL" -o "$tmp/tart.tar.gz"
-    sum=$(/usr/bin/shasum -a 256 "$tmp/tart.tar.gz" | /usr/bin/awk '{print $1}')
-    [ "$sum" = "$TART_ARCHIVE_SHA256" ] || die "Tart checksum mismatch"
-    /bin/mkdir "$tmp/unpack"
-    /usr/bin/tar -xzf "$tmp/tart.tar.gz" -C "$tmp/unpack"
-    verify_bundle "$tmp/unpack" || die "Tart signature or identity verification failed"
-    /bin/mv "$tmp/unpack" "$release"
-    trap - EXIT HUP INT TERM
-    /bin/rm -rf "$tmp"
 )
 
-write_agent() {
-    tmp=$STATE/agent.$$.plist
-    {
-        echo '<?xml version="1.0" encoding="UTF-8"?>'
-        echo '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
-        echo '<plist version="1.0"><dict>'
-        printf '<key>Label</key><string>%s</string>\n' "$LABEL"
-        printf '<key>ProgramArguments</key><array><string>%s/bin/gremvm</string><string>_supervise</string></array>\n' "$ROOT"
-        echo '<key>LimitLoadToSessionType</key><string>Aqua</string>'
-        printf '<key>KeepAlive</key><dict><key>PathState</key><dict><key>%s</key><true/></dict></dict>\n' "$WANTS"
-        exit_timeout=$((2 * GREMVM_SHUTDOWN_TIMEOUT + 60))
-        printf '<key>ProcessType</key><string>Background</string><key>ThrottleInterval</key><integer>10</integer><key>ExitTimeOut</key><integer>%s</integer>\n' "$exit_timeout"
-        printf '<key>StandardOutPath</key><string>%s/vm.log</string><key>StandardErrorPath</key><string>%s/vm.error.log</string>\n' "$LOGS" "$LOGS"
-        echo '</dict></plist>'
-    } > "$tmp"
-    /usr/bin/plutil -lint "$tmp" > /dev/null
-    /usr/bin/install -m 600 "$tmp" "$AGENT"
-    /bin/rm -f "$tmp"
+activate_lume_release() {
+    runtime_dir=$ROOT/runtime
+    release_dir=$runtime_dir/lume-$LUME_VERSION
+    verify_lume_bundle "$release_dir" || die "prepared Lume runtime failed verification: $release_dir"
+    if [ -e "$runtime_dir/current" ] && [ ! -L "$runtime_dir/current" ]; then
+        die "refusing to replace non-symlink Lume activation path: $runtime_dir/current"
+    fi
+    next_link=$runtime_dir/.current.$$
+    /bin/ln -s "lume-$LUME_VERSION" "$next_link"
+    /bin/mv -f -h "$next_link" "$runtime_dir/current"
+    [ -L "$runtime_dir/current" ] || die "Lume activation path is not a symbolic link"
+    verify_lume_bundle "$runtime_dir/current" || die "activated Lume runtime failed verification"
 }
 
-install_cmd() {
-    load_pin
-    load_cloudflared_pin
-    [ "$(/usr/bin/uname -s)" = Darwin ] && [ "$(/usr/bin/uname -m)" = arm64 ] || die "requires Apple-silicon macOS"
-    for tool in aa codesign curl lockf plutil ssh ssh-keygen ssh-keyscan; do command -v "$tool" > /dev/null || die "missing macOS tool: $tool"; done
-    /bin/mkdir -p "$ROOT/bin" "$ROOT/config" "$ROOT/logs" "$ROOT/runtime" \
-        "$ROOT/cloudflare" "$ROOT/ssh" "$ROOT/state" "$ROOT/tart" "$ROOT/versions" \
-        "$HOST_HOME/Library/LaunchAgents"
-    /bin/chmod 700 "$ROOT" "$CLOUDFLARE_DIR" "$SSH_DIR" "$STATE" "$TART_HOME"
-    if [ ! -e "$CONFIG" ]; then
-        [ -r "$REPO/config/gremvm.env.example" ] || die "missing config template"
-        /usr/bin/install -m 600 "$REPO/config/gremvm.env.example" "$CONFIG"
-    fi
-    /usr/bin/touch "$LOGS/vm.log" "$LOGS/vm.error.log"
-    /bin/chmod 600 "$LOGS"/*.log
-    prepare_runtime
-    current=$ROOT/runtime/current
-    [ ! -e "$current" ] || [ -L "$current" ] || die "runtime/current must be a symlink"
-    /bin/ln -hfs "tart-$TART_VERSION" "$current"
-    verify_bundle "$current" || die "activated Tart failed verification"
-    cloudflared_release=$ROOT/runtime/cloudflared-$CLOUDFLARED_VERSION
-    bundled_cloudflared=${GREMVM_BUNDLED_CLOUDFLARED:-}
-    [ -x "$bundled_cloudflared" ] || die "cloudflared is missing; install with 'nix run path:. -- install'"
-    /bin/mkdir -p "$cloudflared_release"
-    /usr/bin/install -m 755 "$bundled_cloudflared" "$cloudflared_release/cloudflared"
-    case $("$cloudflared_release/cloudflared" --version 2> /dev/null) in
-        "cloudflared version $CLOUDFLARED_VERSION "*) ;;
-        *) die "cloudflared version does not match the repository pin" ;;
+prepare_runtime_paths() {
+    mkdir -p "$VM_STORAGE" "$LOG_DIR" "$STATE_DIR"
+    chmod 700 "$ROOT" "$VM_STORAGE" "$LOG_DIR" "$STATE_DIR"
+}
+
+write_launch_agent() {
+    mkdir -p "$HOME/Library/LaunchAgents" "$LOG_DIR"
+    chmod 700 "$LOG_DIR"
+    /usr/bin/touch "$LOG_DIR/vm.log" "$LOG_DIR/vm.error.log"
+    chmod 600 "$LOG_DIR/vm.log" "$LOG_DIR/vm.error.log"
+
+    plist_tmp=$HOME/Library/LaunchAgents/.$LABEL.$$.plist
+    cli_xml=$(printf '%s' "$ROOT/bin/gremvm" | xml_escape)
+    home_xml=$(printf '%s' "$HOME" | xml_escape)
+    ready_xml=$(printf '%s' "$STATE_DIR/READY" | xml_escape)
+    /usr/bin/plutil -create xml1 "$plist_tmp"
+    /usr/bin/plutil -insert Label -string "$LABEL" "$plist_tmp"
+    /usr/bin/plutil -insert ProgramArguments -xml "<array><string>$cli_xml</string><string>internal-supervise</string></array>" "$plist_tmp"
+    /usr/bin/plutil -insert KeepAlive -xml "<dict><key>PathState</key><dict><key>$ready_xml</key><true/></dict></dict>" "$plist_tmp"
+    /usr/bin/plutil -insert ThrottleInterval -integer 20 "$plist_tmp"
+    /usr/bin/plutil -insert LimitLoadToSessionType -string Aqua "$plist_tmp"
+    /usr/bin/plutil -insert StandardOutPath -string "$LOG_DIR/vm.log" "$plist_tmp"
+    /usr/bin/plutil -insert StandardErrorPath -string "$LOG_DIR/vm.error.log" "$plist_tmp"
+    /usr/bin/plutil -insert EnvironmentVariables -xml "<dict><key>HOME</key><string>$home_xml</string></dict>" "$plist_tmp"
+    /usr/bin/plutil -lint "$plist_tmp" > /dev/null
+    chmod 644 "$plist_tmp"
+    /bin/mv "$plist_tmp" "$LAUNCH_AGENT"
+}
+
+firewall_ok() {
+    load_release
+    firewall=/usr/libexec/ApplicationFirewall/socketfilterfw
+    [ -x "$firewall" ] || return 1
+    global=$($firewall --getglobalstate 2> /dev/null || true)
+    case $global in
+        *'State = 1'*) ;;
+        *) return 1 ;;
     esac
-    cloudflared_current=$ROOT/runtime/current-cloudflared
-    [ ! -e "$cloudflared_current" ] || [ -L "$cloudflared_current" ] || die "runtime/current-cloudflared must be a symlink"
-    /bin/ln -hfs "cloudflared-$CLOUDFLARED_VERSION" "$cloudflared_current"
-    [ "$SCRIPT" = "$ROOT/bin/gremvm" ] || /usr/bin/install -m 755 "$SCRIPT" "$ROOT/bin/gremvm"
-    [ "$PIN" = "$ROOT/versions/tart.env" ] || /usr/bin/install -m 600 "$PIN" "$ROOT/versions/tart.env"
-    [ "$CLOUDFLARED_PIN" = "$ROOT/versions/cloudflared.env" ] || /usr/bin/install -m 600 "$CLOUDFLARED_PIN" "$ROOT/versions/cloudflared.env"
-    service_loaded && /bin/launchctl bootout "$(target)" > /dev/null
-    write_agent
-    load_service
-    note "Installed verified Tart $TART_VERSION and cloudflared $CLOUDFLARED_VERSION; VM autostart begins after host login."
-    note "Host FileVault and automatic login were not changed."
+    app=$ROOT/runtime/lume-$LUME_VERSION/lume.app
+    blocked=$($firewall --getappblocked "$app" 2> /dev/null || true)
+    case $blocked in
+        *' is blocked.'*) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
-ensure_key() {
-    key=$SSH_DIR/shutdown_ed25519
-    if [ ! -e "$key" ] && [ ! -e "$key.pub" ]; then /usr/bin/ssh-keygen -q -t ed25519 -N '' -C gremvm-shutdown -f "$key"; fi
-    [ -f "$key" ] && [ -f "$key.pub" ] || die "incomplete shutdown key pair"
-    /bin/chmod 600 "$key" "$key.pub"
+configure_firewall() {
+    firewall=/usr/libexec/ApplicationFirewall/socketfilterfw
+    [ -x "$firewall" ] || die "macOS Application Firewall control tool is unavailable"
+    global=$($firewall --getglobalstate 2> /dev/null || true)
+    case $global in
+        *'State = 1'*) ;;
+        *) die "macOS Application Firewall is disabled. Enable it, then rerun install." ;;
+    esac
+    app=$ROOT/runtime/lume-$LUME_VERSION/lume.app
+    note "Adding a deny-inbound Application Firewall rule for Lume (administrator approval may be requested)..."
+    sudo "$firewall" --add "$app" > /dev/null 2>&1 || true
+    sudo "$firewall" --blockapp "$app" > /dev/null
+    firewall_ok || die "the deny-inbound Lume firewall rule could not be verified"
 }
 
-write_bootstrap() {
-    ensure_key
-    /bin/mkdir -p "$BOOTSTRAP"
-    public=$(/usr/bin/sed -n '1p' "$SSH_DIR/shutdown_ed25519.pub")
-    case $public in ssh-ed25519\ *) ;; *) die "invalid shutdown public key" ;; esac
-    auth="restrict,command=\"sudo -n /usr/local/libexec/gremvm-shutdown\" $public"
-    out=$BOOTSTRAP/install-in-guest.sh
-    tmp=$BOOTSTRAP/.install.$$
-    {
-        echo '#!/bin/sh'
-        echo 'set -eu'
-        echo 'umask 077'
-        printf "user='%s'\nkey='%s'\n" "$GREMVM_GUEST_ADMIN_USER" "$auth"
-        # These expansions intentionally belong to the generated guest script.
-        # shellcheck disable=SC2016
-        printf '%s\n' \
-            '[ "$(id -u)" -eq 0 ] || { echo "run with sudo" >&2; exit 1; }' \
-            'home=$(/usr/bin/dscl . -read "/Users/$user" NFSHomeDirectory | /usr/bin/awk "{print \\$2}")' \
-            '[ -d "$home" ] || { echo "create account $user first" >&2; exit 1; }' \
-            'install -d -m 700 -o "$user" -g staff "$home/.ssh"; touch "$home/.ssh/authorized_keys"' \
-            'grep -Fqx "$key" "$home/.ssh/authorized_keys" || printf "%s\\n" "$key" >>"$home/.ssh/authorized_keys"' \
-            'chown "$user":staff "$home/.ssh/authorized_keys"; chmod 600 "$home/.ssh/authorized_keys"' \
-            'install -d -m 755 -o root -g wheel /usr/local/libexec /etc/sudoers.d' \
-            'printf "#!/bin/sh\\nprintf '\''GREMVM-SHUTDOWN-ACK\\n'\''\\nexec /sbin/shutdown -h now\\n" >/tmp/gremvm-shutdown' \
-            'install -m 755 -o root -g wheel /tmp/gremvm-shutdown /usr/local/libexec/gremvm-shutdown; rm /tmp/gremvm-shutdown' \
-            'printf "%s ALL=(root) NOPASSWD: /usr/local/libexec/gremvm-shutdown\\n" "$user" >/tmp/gremvm-sudoers' \
-            '/usr/sbin/visudo -cf /tmp/gremvm-sudoers; install -m 440 -o root -g wheel /tmp/gremvm-sudoers /etc/sudoers.d/gremvm-shutdown; rm /tmp/gremvm-sudoers' \
-            '/usr/sbin/systemsetup -setremotelogin on || echo "Enable Remote Login in System Settings" >&2' \
-            '/usr/sbin/systemsetup -setsleep off >/dev/null 2>&1 || true' \
-            'echo "Bootstrap installed. Shut down the guest from its Apple menu."'
-    } > "$tmp"
-    /bin/chmod 755 "$tmp"
-    /bin/mv -f "$tmp" "$out"
+require_tahoe_host() {
+    host_version=$(/usr/bin/sw_vers -productVersion) || die "could not determine the host macOS version"
+    host_major=${host_version%%.*}
+    case $host_major in
+        26) ;;
+        *) die "this minimal Lume deployment supports a macOS 26 (Tahoe) host only" ;;
+    esac
 }
 
-find_ssh() {
-    deadline=$(($(/bin/date +%s) + $1))
-    while [ "$(/bin/date +%s)" -lt "$deadline" ]; do
-        ip=$(tart ip "$GREMVM_VM_NAME" --wait 1 2> /dev/null || true)
-        scan=$([ -n "$ip" ] && /usr/bin/ssh-keyscan -T 5 -t ed25519 "$ip" 2> /dev/null | /usr/bin/awk '$2=="ssh-ed25519"{print $2" "$3;exit}' || true)
-        if [ -n "$scan" ]; then
-            if [ -e "$SSH_DIR/guest-host-key" ]; then
-                if [ "$(/usr/bin/sed -n '1p' "$SSH_DIR/guest-host-key")" != "$scan" ]; then
-                    note "Guest SSH host key changed; refusing the connection."
-                    return 1
+write_provision_state() {
+    next_state=$1
+    case $next_state in
+        creating | created | sip-disabled | ready) ;;
+        *) die "invalid provision state: $next_state" ;;
+    esac
+    state_tmp=$STATE_DIR/.provision-state.$$
+    printf '%s\n' "$next_state" > "$state_tmp"
+    /bin/mv "$state_tmp" "$STATE_DIR/provision-state"
+    if [ "$next_state" = ready ]; then
+        /usr/bin/touch "$STATE_DIR/READY"
+        chmod 600 "$STATE_DIR/READY"
+    else
+        /bin/rm -f "$STATE_DIR/READY"
+    fi
+}
+
+provision_state() {
+    state_file=$STATE_DIR/provision-state
+    if [ -e "$state_file" ]; then
+        [ -r "$state_file" ] || die "provision state is unreadable: $state_file"
+        recorded_state=$(/bin/cat "$state_file")
+        case $recorded_state in
+            creating) printf '%s\n' creating ;;
+            created | sip-disabled | ready)
+                if vm_exists; then
+                    printf '%s\n' "$recorded_state"
+                else
+                    printf '%s\n' managed-vm-missing
                 fi
-            else
-                echo "$scan" > "$SSH_DIR/guest-host-key"
-            fi
-            printf '%s %s\n' "$ip" "$scan" > "$SSH_DIR/known_hosts"
-            GUEST_IP=$ip
-            return
-        fi
-        /bin/sleep 2
+                ;;
+            *) die "unknown provision state in $state_file: $recorded_state" ;;
+        esac
+    elif vm_exists; then
+        printf '%s\n' foreign-vm
+    else
+        printf '%s\n' absent
+    fi
+}
+
+install_command() {
+    [ "$(uname -s)" = Darwin ] || die "the host must be macOS"
+    [ "$(uname -m)" = arm64 ] || die "Lume requires an Apple-silicon Mac"
+    require_tahoe_host
+    load_release
+    prepare_runtime_paths
+
+    if service_loaded; then
+        stop_command
+    fi
+
+    prepare_lume_release
+    configure_firewall
+    mkdir -p "$ROOT/bin" "$ROOT/versions"
+    chmod 700 "$ROOT/bin" "$ROOT/versions"
+    cli_tmp=$ROOT/bin/.gremvm.$$
+    /usr/bin/install -m 755 "$REPO_ROOT/bin/gremvm" "$cli_tmp"
+    /bin/mv "$cli_tmp" "$ROOT/bin/gremvm"
+    /usr/bin/install -m 600 "$VERSIONS_FILE" "$ROOT/versions/lume.env"
+    activate_lume_release
+    write_launch_agent
+
+    if [ "$(provision_state)" = ready ]; then
+        start_command
+    else
+        note "Installed GremVM. Next: $ROOT/bin/gremvm provision"
+    fi
+}
+
+provision_command() {
+    load_release
+    validate_deployment
+    [ -x "$LUME_BIN" ] || die "run '$PROGRAM install' first"
+    firewall_ok || die "Lume's inbound firewall block is missing; rerun '$PROGRAM install'"
+    require_tahoe_host
+    require_command vncdo
+
+    while :; do
+        state=$(provision_state)
+        case $state in
+            absent)
+                write_provision_state creating
+                ;;
+            creating)
+                if vm_exists; then
+                    for required in disk.img nvram.bin config.json; do
+                        [ -f "$VM_STORAGE/$VM_NAME/$required" ] ||
+                            die "Lume creation was interrupted before $required existed; partial VM data was preserved for inspection"
+                    done
+                else
+                    note "Creating the fixed Tahoe VM with Lume's built-in unattended preset..."
+                    lume create "$VM_NAME" --ipsw latest --unattended tahoe --storage "$VM_STORAGE"
+                fi
+                write_provision_state created
+                ;;
+            created)
+                note "Disabling SIP through the VM's paired Recovery environment..."
+                lume sip off "$VM_NAME" --yes --storage "$VM_STORAGE"
+                write_provision_state sip-disabled
+                ;;
+            sip-disabled)
+                write_provision_state ready
+                ;;
+            ready)
+                start_command
+                note "Provisioned '$VM_NAME' with SIP disabled."
+                return 0
+                ;;
+            foreign-vm)
+                die "VM '$VM_NAME' exists without GremVM provision state; preserving it and refusing automatic adoption"
+                ;;
+            managed-vm-missing)
+                /bin/rm -f "$STATE_DIR/READY"
+                die "GremVM provision state exists but VM '$VM_NAME' is missing; refusing to recreate it implicitly"
+                ;;
+            *) die "unhandled provision state: $state" ;;
+        esac
     done
-    return 1
 }
 
-clean_stop() {
-    ensure_key
-    find_ssh "$GREMVM_SHUTDOWN_TIMEOUT" || return 1
-    rc=0
-    output=$(/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=8 -o IdentitiesOnly=yes -o PasswordAuthentication=no \
-        -o KbdInteractiveAuthentication=no -o ServerAliveInterval=5 -o ServerAliveCountMax=3 \
-        -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$SSH_DIR/known_hosts" \
-        -i "$SSH_DIR/shutdown_ed25519" "$GREMVM_GUEST_ADMIN_USER@$GUEST_IP" true 2>&1) || rc=$?
-    first=$(printf '%s\n' "$output" | /usr/bin/sed -n '/./{p;q;}')
-    [ "$first" = GREMVM-SHUTDOWN-ACK ] || return 1
-    [ "$rc" -eq 0 ] || note "Guest closed shutdown channel (SSH $rc)."
-    wait_state stopped "$GREMVM_SHUTDOWN_TIMEOUT"
-}
-
-force_stop() {
-    [ "$(vm_state)" = running ] || return
-    note "WARNING: using Tart's destructive stop fallback."
-    tart stop "$GREMVM_VM_NAME" --timeout 5 > /dev/null 2>&1
-    wait_state stopped 15
-}
-
-verify_bootstrap() {
-    tart run --no-graphics --no-audio --no-clipboard "$GREMVM_VM_NAME" &
-    pid=$!
-    if ! wait_state running 30 || ! clean_stop; then
-        force_stop || true
-        wait "$pid" 2> /dev/null || true
-        return 1
+start_command() {
+    load_release
+    validate_deployment
+    [ -r "$LAUNCH_AGENT" ] || die "not installed; run '$PROGRAM install'"
+    [ "$(provision_state)" = ready ] || die "VM '$VM_NAME' is not ready"
+    firewall_ok || die "Lume's inbound firewall block is missing; rerun '$PROGRAM install'"
+    if service_loaded; then
+        note "VM service is already running."
+        return 0
     fi
-    wait "$pid"
+    launchctl bootstrap "gui/$(id -u)" "$LAUNCH_AGENT"
+    note "VM service started."
 }
 
-provision_cmd() {
-    require_installed
-    [ "$GREMVM_IPSW" = latest ] || [ -f "$GREMVM_IPSW" ] || die "missing IPSW: $GREMVM_IPSW"
-    p=$(phase)
-    if [ "$p" = absent ]; then
-        vm_exists && die "VM name already exists outside provisioning"
-        set_phase creating
-        p=creating
+stop_command() {
+    validate_deployment
+    if service_loaded; then
+        launchctl bootout --wait "$(service_target)"
     fi
-    if [ "$p" = creating ]; then
-        if ! vm_exists; then
-            note "Installing Apple's latest host-supported macOS..."
-            tart create "$GREMVM_VM_NAME" --from-ipsw="$GREMVM_IPSW" --disk-size "$GREMVM_DISK_SIZE_GB"
-        fi
-        tart set "$GREMVM_VM_NAME" --cpu "$GREMVM_CPU_COUNT" --memory "$GREMVM_MEMORY_MB" --display "$GREMVM_DISPLAY"
-        write_bootstrap
-        set_phase needs-setup
-        p=needs-setup
+    if [ -x "$LUME_BIN" ] && vm_exists && [ "$(vm_field status 2> /dev/null || true)" = running ]; then
+        note "Stopping the VM with Lume..."
+        lume stop "$VM_NAME" --storage "$VM_STORAGE"
     fi
-    if [ "$p" = needs-setup ]; then
-        [ "$(vm_state)" = stopped ] || die "setup VM is already running"
-        note "In Setup Assistant create '$GREMVM_GUEST_ADMIN_USER'. In guest Terminal run:"
-        note "  sudo /bin/sh '/Volumes/My Shared Files/bootstrap/install-in-guest.sh'"
-        note "Then shut down the guest from its Apple menu."
-        tart run --no-audio --no-clipboard --dir="bootstrap:$BOOTSTRAP:ro" "$GREMVM_VM_NAME"
-        [ "$(vm_state)" = stopped ] || die "setup guest did not stop"
-        verify_bootstrap || die "bootstrap verification failed; rerun provision and check Remote Login"
-        set_phase ready
-    fi
-    [ "$(phase)" = ready ] && [ "$(vm_state)" = stopped ] || die "provisioning did not finish stopped"
-    : > "$WANTS"
-    load_service
-    /bin/launchctl kickstart "$(target)"
-    note "Provisioned latest supported macOS. SIP was not changed."
+    note "VM service stopped."
 }
 
-start_cmd() {
-    require_installed
-    [ "$(phase)" = ready ] || die "VM is not ready"
-    vm_exists || die "managed VM is missing"
-    s=$(vm_state)
-    if [ "$s" = running ]; then
-        service_running || die "VM runs outside supervisor"
-        : > "$WANTS"
-        note "VM is already running."
-        return
-    fi
-    [ "$s" = stopped ] || die "cannot start VM in state: $s"
-    : > "$WANTS"
-    load_service
-    /bin/launchctl kickstart "$(target)"
-    note "VM start requested."
+restart_command() {
+    stop_command
+    start_command
 }
 
-restart_cmd() {
-    stop_cmd
-    start_cmd
-}
-
-stop_cmd() {
-    require_installed
-    /bin/rm -f "$WANTS"
-    s=$(vm_state)
-    case $s in missing | stopped)
-        note "VM is stopped."
-        return
-        ;;
-    running) ;; *) die "refusing to stop VM in state: $s" ;; esac
-    clean_stop && {
-        note "VM stopped cleanly."
-        return
-    }
-    force_stop || die "clean and fallback stop failed"
-    die "destructive fallback was required; repair guest bootstrap"
-}
-
-status_cmd() {
-    load_pin
-    load_cloudflared_pin
-    load_config
-    installed || {
+status_command() {
+    load_release
+    validate_deployment
+    if [ ! -x "$LUME_BIN" ]; then
         note "state: not-installed"
-        return
-    }
-    p=$(phase)
-    case $p in
-        absent) vm_exists && state=unmanaged-vm || state=not-provisioned ;;
-        creating) state=provisioning-creating ;;
-        needs-setup) state=needs-setup ;;
+        return 0
+    fi
+    deployment_state=$(provision_state)
+    case $deployment_state in
+        absent) state=not-provisioned ;;
+        foreign-vm) state=unmanaged-vm ;;
+        creating | created | sip-disabled) state=provisioning-$deployment_state ;;
+        managed-vm-missing) state=degraded-missing-vm ;;
         ready)
-            s=$(vm_state)
-            desired=false
-            [ -e "$WANTS" ] && desired=true
-            case $s:$desired in running:true) service_running && state=running || state=unmanaged-running ;; running:false) state=unmanaged-running ;; stopped:true) service_loaded && state=starting || state=degraded-service-unloaded ;; stopped:false) state=stopped ;; missing:*) state=degraded-missing-vm ;; *) state=degraded ;; esac
+            vm_status=$(vm_field status 2> /dev/null || printf unknown)
+            if service_loaded; then
+                case $vm_status in
+                    running)
+                        if [ "$(vm_field sshAvailable 2> /dev/null || true)" = true ]; then
+                            state=running
+                        else
+                            state=guest-unavailable
+                        fi
+                        ;;
+                    stopped) state=starting ;;
+                    *) state=degraded ;;
+                esac
+            else
+                case $vm_status in
+                    running) state=unmanaged-running ;;
+                    stopped) state=stopped ;;
+                    *) state=degraded ;;
+                esac
+            fi
             ;;
+        *) die "unhandled provision state: $deployment_state" ;;
     esac
     note "state: $state"
-    note "tart: $TART_VERSION"
-    note "vm: $GREMVM_VM_NAME"
-    if [ -r "$CLOUDFLARE_CREDENTIALS" ]; then note "ssh: configured ($SSH_HOSTNAME)"; else note "ssh: not-configured"; fi
+    note "lume: $LUME_VERSION"
+    if [ "$deployment_state" = ready ]; then
+        note "sip: disabled"
+        if firewall_ok; then
+            note "firewall: enabled-and-lume-blocked"
+        else
+            note "firewall: unsafe-or-unverified"
+        fi
+    fi
 }
 
-logs_cmd() {
-    load_config
-    n=200
-    follow=false
-    while [ "$#" -gt 0 ]; do
-        case $1 in --follow) follow=true ;; --lines)
-            shift
-            [ "$#" -gt 0 ] || die "--lines needs a number"
-            n=$1
-            ;;
-        *) die "unknown logs option: $1" ;; esac
-        shift
+logs_command() {
+    [ "$#" -eq 0 ] || die "usage: $PROGRAM logs"
+    [ -e "$LOG_DIR/vm.log" ] || die "no logs yet; run '$PROGRAM install'"
+    /usr/bin/tail -n 200 "$LOG_DIR/vm.log" "$LOG_DIR/vm.error.log"
+}
+
+uninstall_command() {
+    validate_deployment
+    if service_loaded || { [ -x "$LUME_BIN" ] && vm_exists; }; then
+        stop_command
+    fi
+    [ ! -e "$LAUNCH_AGENT" ] || /bin/rm -f "$LAUNCH_AGENT"
+    for removal in "$ROOT/runtime" "$ROOT/bin" "$ROOT/versions"; do
+        [ ! -e "$removal" ] && [ ! -L "$removal" ] || /bin/rm -R "$removal"
     done
-    case $n in '' | *[!0-9]*) die "invalid line count" ;; esac
-    [ -e "$LOGS/vm.log" ] || die "no logs yet"
-    [ "$follow" = true ] && exec /usr/bin/tail -n "$n" -F "$LOGS/vm.log" "$LOGS/vm.error.log"
-    /usr/bin/tail -n "$n" "$LOGS/vm.log" "$LOGS/vm.error.log"
+    note "Uninstalled GremVM runtime and launchd wiring. VM data and logs were preserved."
 }
 
-console_cmd() {
-    require_installed
-    case $(phase) in ready | needs-setup) ;; *) die "VM is not ready for a console" ;; esac
-    [ ! -e "$WANTS" ] || die "stop the supervised VM before opening its local console"
-    [ "$(vm_state)" = stopped ] || die "console requires a stopped VM"
-    note "Shut down from inside the guest when finished; closing the Tart window is destructive."
-    tart run --no-audio --no-clipboard "$GREMVM_VM_NAME"
+monitor_pause() {
+    /bin/sleep "$1"
 }
 
-runtime_path_cmd() {
-    load_config
-    require_installed
-    printf '%s\n' "$TART"
+runner_active() {
+    runner_state=$(/bin/ps -o state= -p "$1" 2> /dev/null || true)
+    case $runner_state in
+        '' | *Z*) return 1 ;;
+        *) return 0 ;;
+    esac
 }
 
-backup_cmd() {
-    dest=$1
-    require_installed
-    [ "$(phase)" = ready ] || die "VM is not ready"
-    case $dest in /*) ;; *) die "backup destination must be absolute" ;; esac
-    [ -d "$dest" ] && [ ! -L "$dest" ] && [ -w "$dest" ] || die "destination must be an existing writable directory, not a symlink"
-    [ "$(/usr/bin/stat -f %d "$dest")" != "$(/usr/bin/stat -f %d "$TART_HOME")" ] || die "destination must be another mounted filesystem"
-    s=$(vm_state)
-    desired=false
-    [ -e "$WANTS" ] && desired=true
-    if [ "$s" = running ]; then
-        [ "$desired" = true ] || die "VM runs outside supervisor"
-        service_running || die "VM runs outside supervisor"
-    fi
-    if [ "$desired" = true ]; then
-        restart_on_exit=true
-        /bin/rm -f "$WANTS"
-    fi
-    if [ "$s" = running ]; then
-        clean_stop || {
-            die "clean shutdown failed; backup refused"
-        }
-    fi
-    [ "$(vm_state)" = stopped ] || die "backup requires a stopped VM"
-    stamp=$(/bin/date -u +%Y%m%dT%H%M%SZ)
-    base=$dest/$GREMVM_VM_NAME--$stamp
-    partial=$base.tvm.partial
-    archive=$base.tvm
-    manifest=$archive.manifest.json
-    [ ! -e "$partial" ] && [ ! -e "$archive" ] && [ ! -e "$manifest" ] || die "backup name collision"
-    tart export "$GREMVM_VM_NAME" "$partial"
-    [ -s "$partial" ] || die "empty export"
-    /bin/chmod 600 "$partial"
-    listing=$(/usr/bin/aa list -i "$partial") || die "invalid Tart archive"
-    for file in config.json disk.img nvram.bin; do [ "$(printf '%s\n' "$listing" | /usr/bin/awk -v x="$file" '$0==x{n++}END{print n+0}')" -eq 1 ] || die "archive lacks $file"; done
-    sum=$(/usr/bin/shasum -a 256 "$partial" | /usr/bin/awk '{print $1}')
-    bytes=$(/usr/bin/stat -f %z "$partial")
-    printf '{"format":"gremvm-tart-export-v1","vm":"%s","createdAt":"%s","tartVersion":"%s","archive":"%s.tvm","archiveBytes":%s,"archiveSha256":"%s"}\n' "$GREMVM_VM_NAME" "$stamp" "$TART_VERSION" "$GREMVM_VM_NAME--$stamp" "$bytes" "$sum" > "$manifest.partial"
-    /usr/bin/plutil -convert binary1 -o /dev/null "$manifest.partial"
-    /bin/chmod 600 "$manifest.partial"
-    /bin/sync
-    /bin/mv "$partial" "$archive"
-    /bin/mv "$manifest.partial" "$manifest"
-    if [ "$desired" = true ]; then
-        : > "$WANTS"
-        load_service
-        /bin/launchctl kickstart "$(target)"
-        restart_on_exit=false
-    fi
-    note "Backup complete: $archive"
-    note "Manifest: $manifest"
-    note "SHA-256: $sum"
+monitor_guest() {
+    runner_pid=$1
+    monitor_state=startup
+    failed_polls=0
+
+    while runner_active "$runner_pid"; do
+        if [ "$(vm_field sshAvailable 2> /dev/null || true)" = true ]; then
+            monitor_state=healthy
+            failed_polls=0
+        else
+            failed_polls=$((failed_polls + 1))
+            case $monitor_state in
+                startup)
+                    [ "$failed_polls" -lt "$GUEST_STARTUP_POLLS" ] || return 75
+                    ;;
+                healthy)
+                    [ "$failed_polls" -lt "$GUEST_FAILURE_POLLS" ] || return 75
+                    ;;
+                *) die "invalid guest monitor state: $monitor_state" ;;
+            esac
+        fi
+        monitor_pause "$GUEST_POLL_SECONDS"
+    done
 }
 
-uninstall_cmd() {
-    if installed && [ "$(vm_state)" = running ]; then
-        /bin/rm -f "$WANTS"
-        clean_stop || die "clean shutdown failed; refusing uninstall"
+stop_supervised_runner() {
+    [ -n "$RUNNER_PID" ] || return 0
+    kill -TERM "$RUNNER_PID" 2> /dev/null || true
+    remaining_polls=$RUNNER_STOP_POLLS
+    while runner_active "$RUNNER_PID" && [ "$remaining_polls" -gt 0 ]; do
+        monitor_pause 1
+        remaining_polls=$((remaining_polls - 1))
+    done
+    if runner_active "$RUNNER_PID"; then
+        kill -KILL "$RUNNER_PID" 2> /dev/null || true
     fi
-    /bin/rm -f "$WANTS"
-    service_loaded && /bin/launchctl bootout "$(target)" > /dev/null 2>&1 || true
-    /bin/rm -f "$AGENT"
-    /bin/rm -rf "${ROOT:?}/bin" "${ROOT:?}/runtime" "${ROOT:?}/versions"
-    note "Uninstalled service/runtime; preserved VM, config, Cloudflare credentials, keys, logs, and backups under $ROOT"
+    wait "$RUNNER_PID" 2> /dev/null || true
+    RUNNER_PID=
 }
 
-supervise() {
-    load_config
-    require_installed
-    [ "$(phase)" = ready ] && [ -e "$WANTS" ] || exit 0
-    exec 9>> "$STATE/maintenance.lock"
-    /usr/bin/lockf -s -t 30 9 || die "supervisor start lock timeout"
-    [ -e "$WANTS" ] && [ "$(vm_state)" = stopped ] || exit 0
-    exec 9>&-
-    child=
-    tunnel_child=
-    # shellcheck disable=SC2329
-    terminate() {
-        trap - HUP INT TERM
-        [ -z "$tunnel_child" ] || {
-            /bin/kill "$tunnel_child" 2> /dev/null || true
-            wait "$tunnel_child" 2> /dev/null || true
-        }
-        [ -z "$child" ] || {
-            clean_stop || force_stop || true
-            wait "$child" 2> /dev/null || true
-        }
-        exit 0
-    }
-    trap terminate HUP INT TERM
-    tart run --no-graphics --no-audio --no-clipboard "$GREMVM_VM_NAME" &
-    child=$!
-    if [ ! -x "$CLOUDFLARED" ]; then
-        note "cloudflared is not installed; VM lifecycle will continue."
-    elif [ ! -r "$CLOUDFLARE_CREDENTIALS" ]; then
-        note "Cloudflare Tunnel is not configured; run scripts/cloudflare-install-host.sh."
-    else
-        tunnel_loop() {
-            connector=
-            # shellcheck disable=SC2329
-            stop_tunnel_loop() {
-                trap - HUP INT TERM
-                [ -z "$connector" ] || /bin/kill "$connector" 2> /dev/null || true
-                [ -z "$connector" ] || wait "$connector" 2> /dev/null || true
-                exit 0
-            }
-            trap stop_tunnel_loop HUP INT TERM
-            while /bin/kill -0 "$child" 2> /dev/null && [ -e "$WANTS" ]; do
-                if ! find_ssh 30; then
-                    note "Cloudflare Tunnel is waiting for guest SSH."
-                else
-                    tunnel_id=$(/usr/bin/plutil -extract TunnelID raw -o - "$CLOUDFLARE_CREDENTIALS" 2> /dev/null || true)
-                    case $tunnel_id in
-                        ????????-????-????-????-????????????) ;;
-                        *)
-                            note "Cloudflare Tunnel credentials have an invalid TunnelID."
-                            exit 1
-                            ;;
-                    esac
-                    case $tunnel_id in *[!0-9A-Fa-f-]*)
-                        note "Cloudflare Tunnel credentials have an invalid TunnelID."
-                        exit 1
-                        ;;
-                    esac
-                    case $GUEST_IP in *:*) origin="[$GUEST_IP]:22" ;; *) origin=$GUEST_IP:22 ;; esac
-                    config_tmp=$STATE/.cloudflared.$$.json
-                    printf '{"tunnel":"%s","credentials-file":"%s","ingress":[{"hostname":"%s","service":"ssh://%s"},{"service":"http_status:404"}]}\n' \
-                        "$tunnel_id" "$CLOUDFLARE_CREDENTIALS" "$SSH_HOSTNAME" "$origin" > "$config_tmp"
-                    /bin/chmod 600 "$config_tmp"
-                    /bin/mv -f "$config_tmp" "$CLOUDFLARE_CONFIG"
-                    if ! "$CLOUDFLARED" tunnel --config "$CLOUDFLARE_CONFIG" ingress validate; then
-                        note "Cloudflare Tunnel configuration validation failed."
-                    else
-                        "$CLOUDFLARED" tunnel --no-autoupdate --config "$CLOUDFLARE_CONFIG" --loglevel info run "$tunnel_id" &
-                        connector=$!
-                        wait "$connector" 2> /dev/null || true
-                        connector=
-                    fi
-                fi
-                /bin/sleep 5
-            done
-        }
-        tunnel_loop &
-        tunnel_child=$!
-    fi
-    wait "$child" || rc=$?
-    if [ -n "$tunnel_child" ]; then
-        /bin/kill "$tunnel_child" 2> /dev/null || true
-        wait "$tunnel_child" 2> /dev/null || true
-    fi
+handle_supervisor_signal() {
     trap - HUP INT TERM
-    exit "${rc:-0}"
+    stop_supervised_runner
+    exit 0
+}
+
+internal_supervise() {
+    load_release
+    validate_deployment
+    if [ "$(provision_state)" != ready ]; then
+        /bin/rm -f "$STATE_DIR/READY"
+        die "VM is not ready for managed start"
+    fi
+    firewall_ok || die "Lume's inbound firewall block is missing; refusing to start the VM"
+    trap handle_supervisor_signal HUP INT TERM
+    "$LUME_BIN" run "$VM_NAME" --no-display --storage "$VM_STORAGE" &
+    RUNNER_PID=$!
+
+    if monitor_guest "$RUNNER_PID"; then
+        set +e
+        wait "$RUNNER_PID"
+        runner_status=$?
+        set -e
+        RUNNER_PID=
+        exit "$runner_status"
+    fi
+
+    note "Guest remained unavailable; restarting the Lume runner." >&2
+    stop_supervised_runner
+    exit 75
 }
 
 usage() {
-    echo "Usage: $PROGRAM COMMAND"
-    echo '  install | provision | status | start | stop | restart'
-    echo '  console | logs [--follow] [--lines N]'
-    echo '  backup --destination PATH | runtime-path | uninstall'
-    echo 'VM startup is post-login; host FileVault and automatic login are untouched.'
+    cat << EOF
+Usage: $PROGRAM COMMAND
+
+Commands:
+  install                         Install pinned Lume and login-time launchd wiring
+  provision                       Create the fixed Tahoe VM and disable SIP
+  status                          Show VM service state
+  start | stop | restart          Control the VM service
+  logs                            Read the most recent 200 service log lines
+  uninstall                       Remove runtime and launchd wiring; preserve VM data
+EOF
 }
 
-cmd=${1:---help}
+command=${1:-help}
 [ "$#" -eq 0 ] || shift
-case $cmd in
+case $command in
     install)
-        [ "$#" -eq 0 ] || die "install takes no arguments"
-        locked_call install_cmd
+        [ "$#" -eq 0 ] || die "usage: $PROGRAM install"
+        install_command
         ;;
     provision)
-        [ "$#" -eq 0 ] || die "provision takes no arguments"
-        locked_call provision_cmd
+        [ "$#" -eq 0 ] || die "usage: $PROGRAM provision"
+        provision_command
         ;;
     status)
-        [ "$#" -eq 0 ] || die "status takes no arguments"
-        status_cmd
+        [ "$#" -eq 0 ] || die "usage: $PROGRAM status"
+        status_command
         ;;
     start)
-        [ "$#" -eq 0 ] || die "start takes no arguments"
-        locked_call start_cmd
+        [ "$#" -eq 0 ] || die "usage: $PROGRAM start"
+        start_command
         ;;
     stop)
-        [ "$#" -eq 0 ] || die "stop takes no arguments"
-        locked_call stop_cmd
+        [ "$#" -eq 0 ] || die "usage: $PROGRAM stop"
+        stop_command
         ;;
     restart)
-        [ "$#" -eq 0 ] || die "restart takes no arguments"
-        locked_call restart_cmd
+        [ "$#" -eq 0 ] || die "usage: $PROGRAM restart"
+        restart_command
         ;;
-    console)
-        [ "$#" -eq 0 ] || die "console takes no arguments"
-        locked_call console_cmd
-        ;;
-    logs) logs_cmd "$@" ;;
-    backup)
-        [ "$#" -eq 2 ] && [ "$1" = --destination ] || die "usage: backup --destination PATH"
-        locked_call backup_cmd "$2"
-        ;;
-    runtime-path)
-        [ "$#" -eq 0 ] || die "runtime-path takes no arguments"
-        runtime_path_cmd
-        ;;
+    logs) logs_command "$@" ;;
     uninstall)
-        [ "$#" -eq 0 ] || die "uninstall takes no arguments"
-        locked_call uninstall_cmd
+        [ "$#" -eq 0 ] || die "usage: $PROGRAM uninstall"
+        uninstall_command
         ;;
-    _supervise)
-        [ "$#" -eq 0 ] || die "internal command takes no arguments"
-        supervise
+    internal-supervise)
+        [ "$#" -eq 0 ] || die "internal supervisor takes no arguments"
+        internal_supervise
         ;;
-    -h | --help | help) usage ;;
-    *) die "unknown command: $cmd" ;;
+    help | --help | -h) usage ;;
+    *)
+        usage >&2
+        die "unknown command: $command"
+        ;;
 esac
