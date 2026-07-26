@@ -13,7 +13,7 @@ There is no remote-access setup, guest-management layer, backup implementation, 
 
 ## Host behavior
 
-This supports an Apple-silicon Mac running macOS 26 (Tahoe). The Tahoe restriction keeps the SIP-disable path on Lume's supported unattended preset with the least wrapper code.
+The host must meet Lume's upstream requirements: an Apple-silicon Mac running macOS 13 or later. GremVM does not pin the host to a specific macOS release. Lume and Apple's Virtualization framework decide whether the Tahoe restore image is supported by the current host; provisioning fails normally if it is not.
 
 The VM starts after the owning host account signs in. GremVM never changes FileVault or automatic-login settings. Consequently, after a cold boot with FileVault enabled, someone must unlock the Mac and sign in; with no signed-in owner, the VM remains stopped.
 
