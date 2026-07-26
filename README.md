@@ -7,7 +7,7 @@ It does only this:
 - installs a pinned, verified Lume release;
 - creates the VM with Lume's built-in unattended Tahoe preset and disables SIP;
 - starts Lume after the owning host user logs in; and
-- lets launchd restart Lume if its runner exits.
+- restarts Lume if its runner exits or the guest remains unavailable.
 
 There is no remote-access setup, guest-management layer, backup implementation, configuration file, or tunable VM settings. VM data is never deleted by default.
 
@@ -19,7 +19,7 @@ The VM starts after the owning host account signs in. GremVM never changes FileV
 
 Lume itself supplies the guest setup needed to disable SIP. GremVM does not expose or configure a way to connect to the guest. `install` requires the macOS Application Firewall and blocks inbound traffic to Lume, because Lume creates its own local VNC control listener.
 
-The launchd policy restarts Lume when its runner exits. It does not add a separate guest-health agent: if macOS inside the VM is deliberately shut down while the Lume runner stays alive, use `gremvm restart`.
+The supervisor uses Lume's existing guest SSH-readiness result as a health signal; it does not install a guest agent or authenticate into the guest. Guest Remote Login must therefore remain enabled. It allows roughly ten minutes for boot and fifteen minutes for a previously healthy guest to recover, reducing false restarts during macOS updates. Sustained failure terminates the stuck Lume runner, and launchd starts it again.
 
 ## Install
 

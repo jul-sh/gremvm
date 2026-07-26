@@ -83,3 +83,52 @@ setup() {
     [ "$status" -eq 0 ]
     [ -f "$root/vms/work/sentinel" ]
 }
+
+@test "guest monitor requests restart after sustained unavailability" {
+    run env HOME="$TEST_HOME" sh -c '
+        . "$1" --help >/dev/null
+        monitor_marker=$2/healthy
+        monitor_count=$2/count
+        printf "0\n" > "$monitor_count"
+        vm_field() {
+            count=$(/bin/cat "$monitor_count")
+            count=$((count + 1))
+            printf "%s\n" "$count" > "$monitor_count"
+            if [ -e "$monitor_marker" ]; then
+                printf "false\n"
+            else
+                : > "$monitor_marker"
+                printf "true\n"
+            fi
+        }
+        monitor_pause() { :; }
+        runner_active() { kill -0 "$1" 2>/dev/null; }
+        /bin/sleep 60 &
+        monitored_pid=$!
+        set +e
+        monitor_guest "$monitored_pid"
+        result=$?
+        kill "$monitored_pid" 2>/dev/null || true
+        wait "$monitored_pid" 2>/dev/null || true
+        exit "$result"
+    ' sh "$REPO_ROOT/bin/gremvm" "$BATS_TEST_TMPDIR"
+    [ "$status" -eq 75 ]
+    [ "$(/bin/cat "$BATS_TEST_TMPDIR/count")" -eq 46 ]
+}
+
+@test "stuck Lume runner is killed after bounded TERM grace" {
+    run env HOME="$TEST_HOME" sh -c '
+        . "$1" --help >/dev/null
+        monitor_pause() { :; }
+        runner_active() { kill -0 "$1" 2>/dev/null; }
+        runner_marker=$2/runner-ready
+        /bin/sh -c '\''trap "" TERM; : > "$1"; while :; do :; done'\'' sh "$runner_marker" &
+        RUNNER_PID=$!
+        while [ ! -e "$runner_marker" ]; do
+            /bin/sleep 0.01
+        done
+        stop_supervised_runner
+        [ -z "$RUNNER_PID" ]
+    ' sh "$REPO_ROOT/bin/gremvm" "$BATS_TEST_TMPDIR"
+    [ "$status" -eq 0 ]
+}
