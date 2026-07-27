@@ -1,6 +1,14 @@
 # GremVM
 
-GremVM manages one persistent macOS Tahoe virtual machine with [Tart](https://tart.run/) on Apple silicon. It gives the guest a bridged LAN address and supervises it with a rootless per-user launchd service, so the VM can be started over SSH and keep running after that connection closes.
+An agent needs a computer.
+
+You can give it your personal Mac, but then it can damage your files, credentials, and environment. You can create a separate user account, but Macs do not handle multi-tenancy well for development work. You can buy another Mac, but now you need another Mac. A VM is the natural middle ground: isolated, snapshotable, and disposable.
+
+The desired abstraction is simple: one more Mac on your local network.
+
+It should have its own IP address. You should be able to SSH or Screen Share into it. It should keep running when you disconnect and recover when it stops. The fact that it is a VM should mostly disappear.
+
+GremVM approximates this with [Tart](https://tart.run/): a persistent macOS Tahoe VM, supervised by the host and exposed directly to the LAN. It is intended to feel like an always-on Mac for agentic work, without requiring another physical machine.
 
 ## Behavior
 
