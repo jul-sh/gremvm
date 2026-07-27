@@ -4,19 +4,25 @@ set -eu
 umask 077
 
 PROGRAM=${0##*/}
-LABEL=io.gremvm.lume
+LABEL=io.gremvm.tart
 HOST_HOME=$HOME
 ROOT=$HOST_HOME/Library/Application\ Support/GremVM
+TART_HOME=$ROOT/tart
 VM_NAME=work
-VM_STORAGE=$ROOT/vms
-LUME_BIN=$ROOT/runtime/current/lume.app/Contents/MacOS/lume
+VM_DIR=$TART_HOME/vms/$VM_NAME
+CONTROL_SOCKET=$VM_DIR/control.sock
+TART_BIN=$ROOT/runtime/current/tart.app/Contents/MacOS/tart
 LAUNCH_AGENT=$HOST_HOME/Library/LaunchAgents/$LABEL.plist
 LOG_DIR=$ROOT/logs
 STATE_DIR=$ROOT/state
-GUEST_POLL_SECONDS=20
-GUEST_STARTUP_POLLS=30
-GUEST_FAILURE_POLLS=45
-RUNNER_STOP_POLLS=10
+LIFECYCLE_DIR=$STATE_DIR/tart-lifecycle
+READY_STATE=$LIFECYCLE_DIR/ready
+LIFECYCLE_LOCK=$STATE_DIR/tart-lifecycle.lock
+BRIDGE_FILE=$STATE_DIR/bridge-interface
+GUEST_USER='admin'
+HARDENING_CONFIRMATION='DEFAULT CREDENTIALS AND SSH KEYS CHANGED'
+STOP_TIMEOUT=30
+START_TIMEOUT=30
 RUNNER_PID=
 
 SCRIPT_PATH=$0
@@ -39,8 +45,8 @@ while [ -L "$SCRIPT_PATH" ]; do
 done
 SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd -P)
 REPO_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIR/.." && pwd -P)
-VERSIONS_FILE=$REPO_ROOT/versions/lume.env
-readonly PROGRAM LABEL HOST_HOME ROOT VM_NAME VM_STORAGE LUME_BIN LAUNCH_AGENT LOG_DIR STATE_DIR GUEST_POLL_SECONDS GUEST_STARTUP_POLLS GUEST_FAILURE_POLLS RUNNER_STOP_POLLS SCRIPT_DIR REPO_ROOT VERSIONS_FILE
+VERSIONS_FILE=$REPO_ROOT/versions/tart.env
+readonly PROGRAM LABEL HOST_HOME ROOT TART_HOME VM_NAME VM_DIR CONTROL_SOCKET TART_BIN LAUNCH_AGENT LOG_DIR STATE_DIR LIFECYCLE_DIR READY_STATE LIFECYCLE_LOCK BRIDGE_FILE GUEST_USER HARDENING_CONFIRMATION STOP_TIMEOUT START_TIMEOUT SCRIPT_DIR REPO_ROOT VERSIONS_FILE
 
 die() {
     printf '%s: %s\n' "$PROGRAM" "$*" >&2
@@ -63,124 +69,217 @@ load_release() {
 }
 
 validate_deployment() {
-    [ ! -L "$VM_STORAGE/$VM_NAME" ] || die "VM directory may not be a symbolic link"
+    [ ! -L "$ROOT" ] || die "deployment root may not be a symbolic link"
+    [ ! -L "$TART_HOME" ] || die "Tart home may not be a symbolic link"
+    [ ! -L "$TART_HOME/vms/$VM_NAME" ] || die "VM directory may not be a symbolic link"
 }
 
-lume() {
-    [ -x "$LUME_BIN" ] || die "Lume is not installed; run '$PROGRAM install'"
-    "$LUME_BIN" "$@"
+tart() {
+    [ -x "$TART_BIN" ] || die "Tart is not installed; run '$PROGRAM install'"
+    /usr/bin/env -u TRACEPARENT TART_HOME="$TART_HOME" "$TART_BIN" "$@"
 }
+
+run_tart_vm() (
+    [ -x "$TART_BIN" ] || die "Tart is not installed; run '$PROGRAM install'"
+    [ -d "$VM_DIR" ] && [ ! -L "$VM_DIR" ] || die "unsafe or missing Tart VM directory: $VM_DIR"
+    case $(vm_state) in
+        stopped | suspended) ;;
+        running) die "refusing to replace the control socket of a running Tart VM" ;;
+        *) die "cannot prepare the Tart control socket from the current VM state" ;;
+    esac
+    if [ -e "$CONTROL_SOCKET" ] || [ -L "$CONTROL_SOCKET" ]; then
+        [ -S "$CONTROL_SOCKET" ] && [ ! -L "$CONTROL_SOCKET" ] ||
+            die "refusing to replace unsafe Tart control socket path: $CONTROL_SOCKET"
+        /bin/rm -f "$CONTROL_SOCKET"
+    fi
+    CDPATH='' cd -- "$VM_DIR" || die "could not enter Tart VM directory: $VM_DIR"
+    exec /usr/bin/env -u TRACEPARENT TART_HOME="$TART_HOME" "$TART_BIN" run "$@"
+)
 
 service_target() {
     printf 'gui/%s/%s\n' "$(id -u)" "$LABEL"
 }
 
 service_loaded() {
-    launchctl print "$(service_target)" > /dev/null 2>&1
+    /bin/launchctl print "$(service_target)" > /dev/null 2>&1
+}
+
+bootout_current_service() {
+    /bin/launchctl bootout --wait "$(service_target)"
 }
 
 vm_exists() {
-    lume get "$VM_NAME" --storage "$VM_STORAGE" --format json > /dev/null 2>&1
+    tart get "$VM_NAME" --format json > /dev/null 2>&1
 }
 
-vm_field() {
-    field=$1
-    lume get "$VM_NAME" --storage "$VM_STORAGE" --format json 2> /dev/null |
-        /usr/bin/plutil -extract "0.$field" raw -o - - 2> /dev/null
+vm_state() {
+    vm_json=$(tart get "$VM_NAME" --format json 2> /dev/null) || {
+        printf '%s\n' missing
+        return
+    }
+    printf '%s' "$vm_json" | /usr/bin/plutil -extract State raw -o - - 2> /dev/null || printf '%s\n' unknown
 }
 
 xml_escape() {
     /usr/bin/sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' -e "s/'/\&apos;/g"
 }
 
-verify_lume_bundle() {
-    release_dir=$1
-    [ -d "$release_dir/lume.app" ] || return 1
-    signed_lume=$release_dir/lume.app/Contents/MacOS/lume
-    [ -x "$signed_lume" ] || return 1
-    /usr/bin/codesign --verify --deep --strict "$release_dir/lume.app" > /dev/null 2>&1 || return 1
-    /usr/sbin/spctl --assess --type execute "$release_dir/lume.app" > /dev/null 2>&1 || return 1
-    signature=$(/usr/bin/codesign -dv --verbose=4 "$release_dir/lume.app" 2>&1) || return 1
-    team=$(printf '%s\n' "$signature" | /usr/bin/awk -F= '$1 == "TeamIdentifier" { print $2 }')
-    identifier=$(printf '%s\n' "$signature" | /usr/bin/awk -F= '$1 == "Identifier" { print $2 }')
-    [ "$team" = "$LUME_TEAM_ID" ] || return 1
-    [ "$identifier" = "$LUME_BUNDLE_ID" ] || return 1
-    printf '%s\n' "$signature" | /usr/bin/grep -Eq '^CodeDirectory .*flags=.*\(runtime\)' || return 1
-    reported=$("$signed_lume" --version 2> /dev/null) || return 1
-    [ "$reported" = "$LUME_VERSION" ]
+verify_tart_bundle() {
+    verify_release_dir=$1
+    verify_app=$verify_release_dir/tart.app
+    verify_binary=$verify_app/Contents/MacOS/tart
+    [ -x "$verify_binary" ] || return 1
+    /usr/bin/codesign --verify --deep --strict "$verify_app" > /dev/null 2>&1 || return 1
+    /usr/sbin/spctl --assess --type execute "$verify_app" > /dev/null 2>&1 || return 1
+    verify_signature=$(/usr/bin/codesign -dv --verbose=4 "$verify_app" 2>&1) || return 1
+    verify_team=$(printf '%s\n' "$verify_signature" | /usr/bin/awk -F= '$1 == "TeamIdentifier" { print $2 }')
+    verify_identifier=$(printf '%s\n' "$verify_signature" | /usr/bin/awk -F= '$1 == "Identifier" { print $2 }')
+    [ "$verify_team" = "$TART_TEAM_ID" ] || return 1
+    [ "$verify_identifier" = "$TART_BUNDLE_ID" ] || return 1
+    printf '%s\n' "$verify_signature" | /usr/bin/grep -Eq '^CodeDirectory .*flags=.*\(runtime\)' || return 1
+    verify_reported=$(/usr/bin/env -u TRACEPARENT "$verify_binary" --version 2> /dev/null) || return 1
+    [ "$verify_reported" = "$TART_VERSION" ]
 }
 
-prepare_lume_release() (
+prepare_tart_release() (
     runtime_dir=$ROOT/runtime
-    release_dir=$runtime_dir/lume-$LUME_VERSION
+    release_dir=$runtime_dir/tart-$TART_VERSION
     mkdir -p "$runtime_dir"
     chmod 700 "$runtime_dir"
 
     if [ -e "$release_dir" ]; then
-        verify_lume_bundle "$release_dir" || die "existing Lume runtime failed verification: $release_dir"
-    else
-        require_command curl
-        require_command shasum
-        staging=$(mktemp -d "$runtime_dir/.install.XXXXXX")
-        archive=$staging/lume.tar.gz
-        # shellcheck disable=SC2329 # Called asynchronously by the EXIT trap below.
-        cleanup_install() {
-            /bin/rm -R "$staging"
-        }
-        trap cleanup_install EXIT
-        trap 'exit 129' HUP
-        trap 'exit 130' INT
-        trap 'exit 143' TERM
-
-        note "Downloading pinned Lume $LUME_VERSION..."
-        curl -fL --retry 3 --proto '=https' --tlsv1.2 -o "$archive" "$LUME_ARCHIVE_URL"
-        actual=$(/usr/bin/shasum -a 256 "$archive" | /usr/bin/awk '{print $1}')
-        [ "$actual" = "$LUME_ARCHIVE_SHA256" ] || die "Lume archive checksum mismatch"
-
-        mkdir "$staging/unpack"
-        /usr/bin/tar -xzf "$archive" -C "$staging/unpack"
-        verify_lume_bundle "$staging/unpack" || die "Lume signature, hardened runtime, Gatekeeper, identity, or version verification failed"
-        /bin/mv "$staging/unpack" "$release_dir"
-        trap - EXIT HUP INT TERM
-        /bin/rm -R "$staging"
+        verify_tart_bundle "$release_dir" || die "existing Tart runtime failed verification: $release_dir"
+        [ -f "$release_dir/LICENSE" ] || die "existing Tart runtime is missing its license: $release_dir/LICENSE"
+        exit 0
     fi
+
+    source_app=${GREMVM_BUNDLED_TART_APP:-}
+    source_license=${GREMVM_BUNDLED_TART_LICENSE:-}
+    [ -d "$source_app" ] || die "the Nix-pinned Tart app is unavailable; run 'nix run path:. -- install' from the repository"
+    [ -f "$source_license" ] || die "the Nix-pinned Tart license is unavailable; run 'nix run path:. -- install' from the repository"
+
+    staging=$(mktemp -d "$runtime_dir/.install.XXXXXX")
+    # shellcheck disable=SC2329 # Called asynchronously by the EXIT trap below.
+    cleanup_install() {
+        /bin/rm -R "$staging"
+    }
+    trap cleanup_install EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
+    mkdir "$staging/unpack"
+    note "Installing Nix-pinned Tart $TART_VERSION..."
+    /usr/bin/ditto "$source_app" "$staging/unpack/tart.app"
+    chmod -R u+w "$staging/unpack"
+    verify_tart_bundle "$staging/unpack" || die "Tart signature, hardened runtime, Gatekeeper, identity, or version verification failed"
+    /usr/bin/install -m 444 "$source_license" "$staging/unpack/LICENSE"
+    /bin/mv "$staging/unpack" "$release_dir"
+    trap - EXIT HUP INT TERM
+    /bin/rm -R "$staging"
 )
 
-activate_lume_release() {
+activate_tart_release() {
     runtime_dir=$ROOT/runtime
-    release_dir=$runtime_dir/lume-$LUME_VERSION
-    verify_lume_bundle "$release_dir" || die "prepared Lume runtime failed verification: $release_dir"
+    release_dir=$runtime_dir/tart-$TART_VERSION
+    verify_tart_bundle "$release_dir" || die "prepared Tart runtime failed verification: $release_dir"
+    [ -f "$release_dir/LICENSE" ] || die "prepared Tart runtime is missing its license: $release_dir/LICENSE"
     if [ -e "$runtime_dir/current" ] && [ ! -L "$runtime_dir/current" ]; then
-        die "refusing to replace non-symlink Lume activation path: $runtime_dir/current"
+        die "refusing to replace non-symlink Tart activation path: $runtime_dir/current"
     fi
     next_link=$runtime_dir/.current.$$
-    /bin/ln -s "lume-$LUME_VERSION" "$next_link"
+    /bin/ln -s "tart-$TART_VERSION" "$next_link"
     /bin/mv -f -h "$next_link" "$runtime_dir/current"
-    [ -L "$runtime_dir/current" ] || die "Lume activation path is not a symbolic link"
-    verify_lume_bundle "$runtime_dir/current" || die "activated Lume runtime failed verification"
+    [ -L "$runtime_dir/current" ] || die "Tart activation path is not a symbolic link"
+    verify_tart_bundle "$runtime_dir/current" || die "activated Tart runtime failed verification"
 }
 
 prepare_runtime_paths() {
-    mkdir -p "$VM_STORAGE" "$LOG_DIR" "$STATE_DIR"
-    chmod 700 "$ROOT" "$VM_STORAGE" "$LOG_DIR" "$STATE_DIR"
+    mkdir -p "$ROOT/bin" "$ROOT/runtime" "$ROOT/versions" "$TART_HOME" "$LOG_DIR" "$STATE_DIR"
+    chmod 700 "$ROOT" "$ROOT/bin" "$ROOT/runtime" "$ROOT/versions" "$TART_HOME" "$LOG_DIR" "$STATE_DIR"
+    /usr/bin/touch "$LOG_DIR/vm.log" "$LOG_DIR/vm.error.log"
+    chmod 600 "$LOG_DIR/vm.log" "$LOG_DIR/vm.error.log"
+}
+
+valid_bridge_interface() {
+    case $1 in
+        en[0-9]*)
+            bridge_suffix=${1#en}
+            case $bridge_suffix in
+                '' | *[!0-9]*) return 1 ;;
+                *) return 0 ;;
+            esac
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+bridge_interface_available() (
+    bridge_candidate=$1
+    valid_bridge_interface "$bridge_candidate" || exit 1
+    bridge_details=$(/sbin/ifconfig "$bridge_candidate" 2> /dev/null) || exit 1
+    printf '%s\n' "$bridge_details" | /usr/bin/grep -Eq '^[[:space:]]*status: active$'
+)
+
+default_bridge_interface() {
+    interface=$(/sbin/route -n get default 2> /dev/null | /usr/bin/awk '$1 == "interface:" { print $2; exit }')
+    bridge_interface_available "$interface" || return 1
+    printf '%s\n' "$interface"
+}
+
+persist_bridge_interface() {
+    interface=$1
+    valid_bridge_interface "$interface" || die "invalid bridge interface: $interface"
+    mkdir -p "$STATE_DIR"
+    bridge_tmp=$STATE_DIR/.bridge-interface.$$
+    printf '%s\n' "$interface" > "$bridge_tmp"
+    chmod 600 "$bridge_tmp"
+    /bin/mv "$bridge_tmp" "$BRIDGE_FILE"
+}
+
+write_bridge_interface() {
+    interface=$1
+    valid_bridge_interface "$interface" || die "invalid bridge interface: $interface"
+    bridge_interface_available "$interface" || die "bridge interface is not an active physical enN device: $interface"
+    persist_bridge_interface "$interface"
+}
+
+configured_bridge_value() {
+    [ -f "$BRIDGE_FILE" ] && [ ! -L "$BRIDGE_FILE" ] || die "unsafe bridge interface file: $BRIDGE_FILE"
+    bridge_lines=$(/usr/bin/awk 'END { print NR }' "$BRIDGE_FILE")
+    [ "$bridge_lines" -eq 1 ] || die "bridge interface file must contain exactly one value: $BRIDGE_FILE"
+    interface=$(/usr/bin/sed -n '1p' "$BRIDGE_FILE")
+    valid_bridge_interface "$interface" || die "invalid bridge interface in $BRIDGE_FILE: $interface"
+    printf '%s\n' "$interface"
+}
+
+bridge_interface() {
+    if [ -e "$BRIDGE_FILE" ] || [ -L "$BRIDGE_FILE" ]; then
+        interface=$(configured_bridge_value)
+        bridge_interface_available "$interface" || die "configured bridge interface is not active: $interface"
+        printf '%s\n' "$interface"
+        return 0
+    fi
+    default_bridge_interface || die "no default LAN interface found; run '$PROGRAM bridge INTERFACE'"
 }
 
 write_launch_agent() {
     mkdir -p "$HOME/Library/LaunchAgents" "$LOG_DIR"
     chmod 700 "$LOG_DIR"
-    /usr/bin/touch "$LOG_DIR/vm.log" "$LOG_DIR/vm.error.log"
-    chmod 600 "$LOG_DIR/vm.log" "$LOG_DIR/vm.error.log"
 
     plist_tmp=$HOME/Library/LaunchAgents/.$LABEL.$$.plist
     cli_xml=$(printf '%s' "$ROOT/bin/gremvm" | xml_escape)
     home_xml=$(printf '%s' "$HOME" | xml_escape)
-    ready_xml=$(printf '%s' "$STATE_DIR/READY" | xml_escape)
+    tart_home_xml=$(printf '%s' "$TART_HOME" | xml_escape)
+    ready_xml=$(printf '%s' "$READY_STATE" | xml_escape)
     /usr/bin/plutil -create xml1 "$plist_tmp"
     /usr/bin/plutil -insert Label -string "$LABEL" "$plist_tmp"
     /usr/bin/plutil -insert ProgramArguments -xml "<array><string>$cli_xml</string><string>internal-supervise</string></array>" "$plist_tmp"
     /usr/bin/plutil -insert KeepAlive -xml "<dict><key>PathState</key><dict><key>$ready_xml</key><true/></dict></dict>" "$plist_tmp"
     /usr/bin/plutil -insert ThrottleInterval -integer 20 "$plist_tmp"
+    /usr/bin/plutil -insert ExitTimeOut -integer 50 "$plist_tmp"
     /usr/bin/plutil -insert LimitLoadToSessionType -string Aqua "$plist_tmp"
+    /usr/bin/plutil -insert WorkingDirectory -string "$tart_home_xml" "$plist_tmp"
     /usr/bin/plutil -insert StandardOutPath -string "$LOG_DIR/vm.log" "$plist_tmp"
     /usr/bin/plutil -insert StandardErrorPath -string "$LOG_DIR/vm.error.log" "$plist_tmp"
     /usr/bin/plutil -insert EnvironmentVariables -xml "<dict><key>HOME</key><string>$home_xml</string></dict>" "$plist_tmp"
@@ -189,180 +288,395 @@ write_launch_agent() {
     /bin/mv "$plist_tmp" "$LAUNCH_AGENT"
 }
 
-firewall_ok() {
-    load_release
-    firewall=/usr/libexec/ApplicationFirewall/socketfilterfw
-    [ -x "$firewall" ] || return 1
-    global=$($firewall --getglobalstate 2> /dev/null || true)
-    case $global in
-        *'State = 1'*) ;;
-        *) return 1 ;;
+read_provision_variant() (
+    [ -d "$LIFECYCLE_DIR" ] && [ ! -L "$LIFECYCLE_DIR" ] || die "unsafe or missing Tart lifecycle state"
+    lifecycle_count=0
+    lifecycle_entry=
+    for lifecycle_candidate in "$LIFECYCLE_DIR"/* "$LIFECYCLE_DIR"/.[!.]* "$LIFECYCLE_DIR"/..?*; do
+        [ -e "$lifecycle_candidate" ] || [ -L "$lifecycle_candidate" ] || continue
+        lifecycle_count=$((lifecycle_count + 1))
+        lifecycle_entry=$lifecycle_candidate
+    done
+    [ "$lifecycle_count" -eq 1 ] || die "Tart lifecycle must contain exactly one state variant"
+    [ -f "$lifecycle_entry" ] && [ ! -L "$lifecycle_entry" ] && [ ! -s "$lifecycle_entry" ] ||
+        die "unsafe Tart lifecycle variant: $lifecycle_entry"
+    lifecycle_variant=${lifecycle_entry##*/}
+    case $lifecycle_variant in
+        cloning | randomizing-mac | needs-hardening | ready | managed-vm-missing | restored-needs-hardening | start-failed)
+            printf '%s\n' "$lifecycle_variant"
+            ;;
+        *) die "unknown Tart lifecycle variant: $lifecycle_variant" ;;
     esac
-    app=$ROOT/runtime/lume-$LUME_VERSION/lume.app
-    blocked=$($firewall --getappblocked "$app" 2> /dev/null || true)
-    case $blocked in
-        *' is blocked.'*) return 0 ;;
-        *) return 1 ;;
-    esac
-}
+)
 
-configure_firewall() {
-    firewall=/usr/libexec/ApplicationFirewall/socketfilterfw
-    [ -x "$firewall" ] || die "macOS Application Firewall control tool is unavailable"
-    global=$($firewall --getglobalstate 2> /dev/null || true)
-    case $global in
-        *'State = 1'*) ;;
-        *) die "macOS Application Firewall is disabled. Enable it, then rerun install." ;;
+initialize_provision_state() (
+    initial_state=$1
+    case $initial_state in
+        cloning) ;;
+        *) die "invalid initial provision state: $initial_state" ;;
     esac
-    app=$ROOT/runtime/lume-$LUME_VERSION/lume.app
-    note "Adding a deny-inbound Application Firewall rule for Lume (administrator approval may be requested)..."
-    sudo "$firewall" --add "$app" > /dev/null 2>&1 || true
-    sudo "$firewall" --blockapp "$app" > /dev/null
-    firewall_ok || die "the deny-inbound Lume firewall rule could not be verified"
-}
+    [ ! -e "$LIFECYCLE_DIR" ] && [ ! -L "$LIFECYCLE_DIR" ] || die "Tart lifecycle is already initialized"
+    lifecycle_staging=$STATE_DIR/.tart-lifecycle.$$
+    mkdir "$lifecycle_staging"
+    trap '/bin/rm -R "$lifecycle_staging"' EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    /usr/bin/touch "$lifecycle_staging/$initial_state"
+    chmod 700 "$lifecycle_staging"
+    chmod 600 "$lifecycle_staging/$initial_state"
+    /bin/mv "$lifecycle_staging" "$LIFECYCLE_DIR"
+    trap - EXIT HUP INT TERM
+)
 
-write_provision_state() {
-    next_state=$1
+transition_provision_state() {
+    expected_state=$1
+    next_state=$2
     case $next_state in
-        creating | created | sip-disabled | ready) ;;
-        *) die "invalid provision state: $next_state" ;;
+        randomizing-mac | needs-hardening | ready | managed-vm-missing | restored-needs-hardening | start-failed) ;;
+        *) die "invalid next provision state: $next_state" ;;
     esac
-    state_tmp=$STATE_DIR/.provision-state.$$
-    printf '%s\n' "$next_state" > "$state_tmp"
-    /bin/mv "$state_tmp" "$STATE_DIR/provision-state"
-    if [ "$next_state" = ready ]; then
-        /usr/bin/touch "$STATE_DIR/READY"
-        chmod 600 "$STATE_DIR/READY"
-    else
-        /bin/rm -f "$STATE_DIR/READY"
-    fi
+    current_state=$(read_provision_variant)
+    [ "$current_state" = "$expected_state" ] ||
+        die "refusing lifecycle transition from '$current_state'; expected '$expected_state'"
+    [ ! -e "$LIFECYCLE_DIR/$next_state" ] && [ ! -L "$LIFECYCLE_DIR/$next_state" ] ||
+        die "next lifecycle variant already exists: $next_state"
+    /bin/mv "$LIFECYCLE_DIR/$expected_state" "$LIFECYCLE_DIR/$next_state"
+}
+
+acquire_lifecycle_lock() {
+    mkdir -p "$STATE_DIR"
+    /usr/bin/shlock -p "$$" -f "$LIFECYCLE_LOCK" || die "another provisioning operation is active"
+}
+
+release_lifecycle_lock() {
+    [ ! -e "$LIFECYCLE_LOCK" ] || /bin/rm -f "$LIFECYCLE_LOCK"
+}
+
+vm_path_exists() {
+    [ -e "$TART_HOME/vms/$VM_NAME" ] || [ -L "$TART_HOME/vms/$VM_NAME" ]
 }
 
 provision_state() {
-    state_file=$STATE_DIR/provision-state
-    if [ -e "$state_file" ]; then
-        [ -r "$state_file" ] || die "provision state is unreadable: $state_file"
-        recorded_state=$(/bin/cat "$state_file")
+    if [ -e "$LIFECYCLE_DIR" ] || [ -L "$LIFECYCLE_DIR" ]; then
+        recorded_state=$(read_provision_variant)
         case $recorded_state in
-            creating) printf '%s\n' creating ;;
-            created | sip-disabled | ready)
+            cloning)
+                if vm_exists || ! vm_path_exists; then
+                    printf '%s\n' cloning
+                else
+                    printf '%s\n' corrupt-clone
+                fi
+                ;;
+            randomizing-mac)
                 if vm_exists; then
-                    printf '%s\n' "$recorded_state"
+                    printf '%s\n' randomizing-mac
+                elif vm_path_exists; then
+                    printf '%s\n' corrupt-clone
+                else
+                    printf '%s\n' clone-missing
+                fi
+                ;;
+            needs-hardening)
+                if vm_exists; then
+                    printf '%s\n' needs-hardening
+                elif vm_path_exists; then
+                    printf '%s\n' corrupt-vm
+                else
+                    printf '%s\n' hardening-vm-missing
+                fi
+                ;;
+            ready)
+                if vm_exists; then
+                    printf '%s\n' ready
                 else
                     printf '%s\n' managed-vm-missing
                 fi
                 ;;
-            *) die "unknown provision state in $state_file: $recorded_state" ;;
+            managed-vm-missing)
+                if vm_exists; then
+                    printf '%s\n' restored-vm-needs-random-mac
+                else
+                    printf '%s\n' managed-vm-missing
+                fi
+                ;;
+            restored-needs-hardening)
+                if vm_exists; then
+                    printf '%s\n' restored-vm-needs-hardening
+                elif vm_path_exists; then
+                    printf '%s\n' corrupt-vm
+                else
+                    printf '%s\n' hardening-vm-missing
+                fi
+                ;;
+            start-failed) printf '%s\n' start-failed ;;
+            *) die "unhandled recorded lifecycle state: $recorded_state" ;;
         esac
-    elif vm_exists; then
+    elif vm_exists || vm_path_exists; then
         printf '%s\n' foreign-vm
     else
         printf '%s\n' absent
     fi
 }
 
+quarantine_missing_ready_state() (
+    acquire_lifecycle_lock
+    trap release_lifecycle_lock EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    quarantine_variant=$(read_provision_variant)
+    [ "$quarantine_variant" = ready ] || exit 0
+    vm_exists && exit 0
+    transition_provision_state ready managed-vm-missing
+)
+
+mark_start_failed_state() (
+    acquire_lifecycle_lock
+    trap release_lifecycle_lock EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    failed_start_variant=$(read_provision_variant)
+    case $failed_start_variant in
+        ready) transition_provision_state ready start-failed ;;
+        start-failed) ;;
+        *) die "refusing to mark start failure from lifecycle state '$failed_start_variant'" ;;
+    esac
+)
+
+restore_start_failed_state() (
+    acquire_lifecycle_lock
+    trap release_lifecycle_lock EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    [ "$(read_provision_variant)" = start-failed ] || die "VM is not in the failed-start lifecycle state"
+    vm_exists || die "managed VM '$VM_NAME' is missing"
+    bridge_interface > /dev/null
+    transition_provision_state start-failed ready
+)
+
 install_command() {
     [ "$(uname -s)" = Darwin ] || die "the host must be macOS"
-    [ "$(uname -m)" = arm64 ] || die "Lume requires an Apple-silicon Mac"
+    [ "$(uname -m)" = arm64 ] || die "Tart requires an Apple-silicon Mac"
     load_release
+    validate_deployment
     prepare_runtime_paths
 
     if service_loaded; then
-        stop_command
+        bootout_current_service
+    elif [ -x "$TART_BIN" ] && vm_exists && [ "$(vm_state)" = running ]; then
+        note "Stopping the Tart VM that is running outside the login service before replacing its runtime..."
+        tart stop "$VM_NAME" --timeout "$STOP_TIMEOUT"
+        [ "$(vm_state)" != running ] || die "the unmanaged Tart VM did not stop; refusing runtime replacement"
     fi
+    prepare_tart_release
+    activate_tart_release
 
-    prepare_lume_release
-    configure_firewall
-    mkdir -p "$ROOT/bin" "$ROOT/versions"
-    chmod 700 "$ROOT/bin" "$ROOT/versions"
     cli_tmp=$ROOT/bin/.gremvm.$$
     /usr/bin/install -m 755 "$REPO_ROOT/bin/gremvm" "$cli_tmp"
     /bin/mv "$cli_tmp" "$ROOT/bin/gremvm"
-    /usr/bin/install -m 600 "$VERSIONS_FILE" "$ROOT/versions/lume.env"
-    activate_lume_release
-    write_launch_agent
+    /usr/bin/install -m 600 "$VERSIONS_FILE" "$ROOT/versions/tart.env"
 
-    if [ "$(provision_state)" = ready ]; then
+    install_state=$(provision_state)
+    if [ "$install_state" = managed-vm-missing ]; then
+        quarantine_missing_ready_state
+        install_state=$(provision_state)
+    fi
+
+    if [ ! -e "$BRIDGE_FILE" ]; then
+        detected_bridge=$(default_bridge_interface 2> /dev/null || true)
+        if [ -n "$detected_bridge" ]; then
+            write_bridge_interface "$detected_bridge"
+        fi
+    fi
+
+    write_launch_agent
+    if [ "$install_state" = ready ]; then
         start_command
     else
-        note "Installed GremVM. Next: $ROOT/bin/gremvm provision"
+        note "Installed Tart $TART_VERSION. Next: $ROOT/bin/gremvm provision"
     fi
 }
 
-provision_command() {
+hardening_terminal_available() (
+    [ -r /dev/tty ] && [ -w /dev/tty ] || exit 1
+    exec 2> /dev/null
+    exec 3<> /dev/tty
+)
+
+open_guest_hardening_console() {
+    hardening_terminal_available ||
+        die "guest hardening requires an interactive Terminal; rerun '$PROGRAM provision' there"
+    case $(vm_state) in
+        stopped | suspended) ;;
+        running)
+            die "the guest-hardening VM is already running outside the login service; finish in its local window, shut it down, then rerun '$PROGRAM provision'"
+            ;;
+        missing) die "the guest-hardening VM is missing" ;;
+        *) die "cannot open the guest-hardening VM from its current state" ;;
+    esac
+
+    note "Before this VM may join the LAN, replace its public password and cloned SSH host identity."
+    note "In the local guest Terminal, run: sudo rm -f /etc/ssh/ssh_host_* && sudo ssh-keygen -A"
+    note "Then run 'passwd' to change admin/admin and record: ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub"
+    note "Finally, shut down macOS from the Apple menu."
+    note "The first boot uses Tart's private NAT and is not bridged to the LAN."
+    run_tart_vm --no-audio "$VM_NAME"
+    case $(vm_state) in
+        stopped) ;;
+        suspended) die "the local setup run suspended the guest; fully shut down macOS before enabling the LAN" ;;
+        *) die "the local setup run ended without the guest reaching a stopped state" ;;
+    esac
+}
+
+confirm_guest_hardened() {
+    hardening_terminal_available ||
+        die "guest hardening requires an interactive Terminal; rerun '$PROGRAM provision' there"
+    note "Confirm that admin/admin and the image's cloned SSH host keys were replaced before enabling bridged LAN access."
+    printf "Type '%s' to enable the login service: " "$HARDENING_CONFIRMATION" > /dev/tty
+    IFS= read -r hardening_reply < /dev/tty || die "could not read guest-hardening confirmation"
+    [ "$hardening_reply" = "$HARDENING_CONFIRMATION" ] ||
+        die "guest hardening was not confirmed; the VM remains off the bridged LAN"
+}
+
+provision_command() (
     load_release
     validate_deployment
-    [ -x "$LUME_BIN" ] || die "run '$PROGRAM install' first"
-    firewall_ok || die "Lume's inbound firewall block is missing; rerun '$PROGRAM install'"
-    require_command vncdo
+    [ -x "$TART_BIN" ] || die "run '$PROGRAM install' first"
+    acquire_lifecycle_lock
+    trap release_lifecycle_lock EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
 
     while :; do
-        state=$(provision_state)
-        case $state in
+        deployment_state=$(provision_state)
+        case $deployment_state in
             absent)
-                write_provision_state creating
+                initialize_provision_state cloning
                 ;;
-            creating)
-                if vm_exists; then
-                    for required in disk.img nvram.bin config.json; do
-                        [ -f "$VM_STORAGE/$VM_NAME/$required" ] ||
-                            die "Lume creation was interrupted before $required existed; partial VM data was preserved for inspection"
-                    done
-                else
-                    note "Creating the VM with Lume..."
-                    lume create "$VM_NAME" --ipsw latest --unattended tahoe --storage "$VM_STORAGE"
+            cloning)
+                if ! vm_exists; then
+                    note "Cloning the pinned macOS image with Tart..."
+                    tart clone "$TART_VM_IMAGE" "$VM_NAME"
                 fi
-                write_provision_state created
+                transition_provision_state cloning randomizing-mac
                 ;;
-            created)
-                note "Disabling SIP through the VM's paired Recovery environment..."
-                lume sip off "$VM_NAME" --yes --storage "$VM_STORAGE"
-                write_provision_state sip-disabled
+            randomizing-mac)
+                note "Assigning the persistent VM a unique LAN MAC address..."
+                tart set "$VM_NAME" --random-mac
+                transition_provision_state randomizing-mac needs-hardening
                 ;;
-            sip-disabled)
-                write_provision_state ready
+            needs-hardening)
+                open_guest_hardening_console
+                confirm_guest_hardened
+                transition_provision_state needs-hardening ready
                 ;;
-            ready)
+            ready | start-failed)
+                bridge=$(bridge_interface)
+                release_lifecycle_lock
+                trap - EXIT HUP INT TERM
                 start_command
-                note "Provisioned '$VM_NAME' with SIP disabled."
+                note "Provisioned persistent Tart VM '$VM_NAME' on bridge '$bridge'."
+                note "Run '$ROOT/bin/gremvm address' for LAN connection details."
                 return 0
                 ;;
             foreign-vm)
-                die "VM '$VM_NAME' exists without GremVM provision state; preserving it and refusing automatic adoption"
+                die "Tart VM '$VM_NAME' exists without GremVM Tart state; preserving it and refusing automatic adoption"
                 ;;
             managed-vm-missing)
-                /bin/rm -f "$STATE_DIR/READY"
-                die "GremVM provision state exists but VM '$VM_NAME' is missing; refusing to recreate it implicitly"
+                if [ "$(read_provision_variant)" = ready ]; then
+                    transition_provision_state ready managed-vm-missing
+                fi
+                die "GremVM Tart state exists but VM '$VM_NAME' is missing; refusing to recreate it implicitly"
                 ;;
-            *) die "unhandled provision state: $state" ;;
+            clone-missing)
+                die "the cloned Tart VM disappeared before MAC randomization; refusing to recreate it implicitly"
+                ;;
+            hardening-vm-missing)
+                die "the cloned Tart VM disappeared during guest hardening; refusing to recreate it implicitly"
+                ;;
+            corrupt-clone | corrupt-vm)
+                die "the Tart VM path exists but Tart cannot inspect it; preserving it and refusing to continue"
+                ;;
+            restored-vm-needs-random-mac)
+                note "Assigning the restored VM a new unique LAN MAC address..."
+                tart set "$VM_NAME" --random-mac
+                transition_provision_state managed-vm-missing restored-needs-hardening
+                ;;
+            restored-vm-needs-hardening)
+                open_guest_hardening_console
+                confirm_guest_hardened
+                transition_provision_state restored-needs-hardening ready
+                ;;
+            *) die "unhandled provision state: $deployment_state" ;;
         esac
     done
-}
+)
 
 start_command() {
     load_release
     validate_deployment
-    [ -r "$LAUNCH_AGENT" ] || die "not installed; run '$PROGRAM install'"
-    [ "$(provision_state)" = ready ] || die "VM '$VM_NAME' is not ready"
-    firewall_ok || die "Lume's inbound firewall block is missing; rerun '$PROGRAM install'"
-    if service_loaded; then
-        note "VM service is already running."
-        return 0
+    [ -x "$TART_BIN" ] || die "Tart is not installed; run '$PROGRAM install'"
+    [ -r "$LAUNCH_AGENT" ] || die "login service is not installed; run '$PROGRAM install'"
+    start_state=$(provision_state)
+    if [ "$start_state" = managed-vm-missing ]; then
+        quarantine_missing_ready_state
+        die "managed VM '$VM_NAME' is missing"
     fi
-    launchctl bootstrap "gui/$(id -u)" "$LAUNCH_AGENT"
-    note "VM service started."
+    if [ "$start_state" = start-failed ]; then
+        restore_start_failed_state
+        start_state=$(provision_state)
+    fi
+    [ "$start_state" = ready ] || die "VM '$VM_NAME' is not ready"
+    bridge_interface > /dev/null
+
+    case $(vm_state) in
+        running)
+            service_loaded || die "VM '$VM_NAME' is running outside the login service"
+            note "VM service is already running."
+            return 0
+            ;;
+        stopped | suspended) ;;
+        missing) die "managed VM '$VM_NAME' is missing" ;;
+        *) die "cannot start VM '$VM_NAME' from its current state" ;;
+    esac
+
+    if service_loaded; then
+        /bin/launchctl kickstart "$(service_target)"
+    else
+        /bin/launchctl bootstrap "gui/$(id -u)" "$LAUNCH_AGENT"
+    fi
+    if ! wait_for_vm_running "$START_TIMEOUT"; then
+        if service_loaded; then
+            bootout_current_service || die "VM start timed out and the login service could not be unloaded"
+        fi
+        if vm_exists && [ "$(vm_state)" = running ]; then
+            tart stop "$VM_NAME" --timeout "$STOP_TIMEOUT" ||
+                die "VM start timed out and its Tart runner could not be stopped"
+        fi
+        if vm_exists && [ "$(vm_state)" = running ]; then
+            die "VM start timed out but remained running; lifecycle readiness was left unchanged"
+        fi
+        mark_start_failed_state
+        die "VM service did not reach running state; inspect '$PROGRAM logs' before retrying"
+    fi
+    note "VM service is running."
 }
 
 stop_command() {
+    load_release
     validate_deployment
     if service_loaded; then
-        launchctl bootout --wait "$(service_target)"
+        bootout_current_service
     fi
-    if [ -x "$LUME_BIN" ] && vm_exists && [ "$(vm_field status 2> /dev/null || true)" = running ]; then
-        note "Stopping the VM with Lume..."
-        lume stop "$VM_NAME" --storage "$VM_STORAGE"
+    if [ -x "$TART_BIN" ] && vm_exists && [ "$(vm_state)" = running ]; then
+        note "Stopping the VM with Tart..."
+        tart stop "$VM_NAME" --timeout "$STOP_TIMEOUT"
     fi
-    note "VM service stopped."
+    note "VM service stopped until it is started manually or the host user logs in again."
 }
 
 restart_command() {
@@ -370,53 +684,176 @@ restart_command() {
     start_command
 }
 
+wait_for_vm_running() {
+    start_wait_remaining=$1
+    while [ "$start_wait_remaining" -gt 0 ]; do
+        case $(vm_state) in
+            running) return 0 ;;
+            missing) return 1 ;;
+        esac
+        /bin/sleep 1
+        start_wait_remaining=$((start_wait_remaining - 1))
+    done
+    return 1
+}
+
+resolve_ip() {
+    wait_seconds=$1
+    tart ip "$VM_NAME" --resolver=arp --wait="$wait_seconds"
+}
+
 status_command() {
     load_release
     validate_deployment
-    if [ ! -x "$LUME_BIN" ]; then
+    if [ ! -x "$TART_BIN" ]; then
         note "state: not-installed"
         return 0
     fi
+
     deployment_state=$(provision_state)
     case $deployment_state in
         absent) state=not-provisioned ;;
+        cloning) state=provisioning-cloning ;;
+        randomizing-mac) state=provisioning-randomizing-mac ;;
+        needs-hardening)
+            case $(vm_state) in
+                running) state=guest-hardening-running ;;
+                stopped | suspended) state=awaiting-guest-hardening ;;
+                *) state=degraded-guest-hardening ;;
+            esac
+            ;;
+        clone-missing) state=degraded-missing-clone ;;
+        hardening-vm-missing) state=degraded-missing-hardening-vm ;;
+        corrupt-clone | corrupt-vm) state=degraded-corrupt-vm ;;
         foreign-vm) state=unmanaged-vm ;;
-        creating | created | sip-disabled) state=provisioning-$deployment_state ;;
         managed-vm-missing) state=degraded-missing-vm ;;
+        restored-vm-needs-random-mac) state=restored-awaiting-random-mac ;;
+        restored-vm-needs-hardening) state=restored-awaiting-hardening ;;
+        start-failed) state=degraded-start-failed ;;
         ready)
-            vm_status=$(vm_field status 2> /dev/null || printf unknown)
-            if service_loaded; then
-                case $vm_status in
-                    running)
-                        if [ "$(vm_field sshAvailable 2> /dev/null || true)" = true ]; then
-                            state=running
-                        else
-                            state=guest-unavailable
-                        fi
-                        ;;
-                    stopped) state=starting ;;
-                    *) state=degraded ;;
-                esac
-            else
-                case $vm_status in
-                    running) state=unmanaged-running ;;
-                    stopped) state=stopped ;;
-                    *) state=degraded ;;
-                esac
-            fi
+            case $(vm_state) in
+                running)
+                    if service_loaded; then
+                        state=running
+                    else
+                        state=unmanaged-running
+                    fi
+                    ;;
+                stopped | suspended)
+                    if service_loaded; then
+                        state=starting
+                    else
+                        state=stopped
+                    fi
+                    ;;
+                missing) state=degraded-missing-vm ;;
+                *) state=degraded ;;
+            esac
             ;;
         *) die "unhandled provision state: $deployment_state" ;;
     esac
+
     note "state: $state"
-    note "lume: $LUME_VERSION"
-    if [ "$deployment_state" = ready ]; then
-        note "sip: disabled"
-        if firewall_ok; then
-            note "firewall: enabled-and-lume-blocked"
+    note "tart: $TART_VERSION"
+    note "vm: $VM_NAME"
+    configured_bridge=$(bridge_interface 2> /dev/null || true)
+    if [ -n "$configured_bridge" ]; then
+        note "bridge: $configured_bridge"
+    else
+        note "bridge: unavailable"
+    fi
+    if [ "$state" = running ] || [ "$state" = unmanaged-running ]; then
+        guest_ip=$(resolve_ip 0 2> /dev/null || true)
+        if [ -n "$guest_ip" ]; then
+            note "ip: $guest_ip"
         else
-            note "firewall: unsafe-or-unverified"
+            note "ip: discovering"
         fi
     fi
+}
+
+address_command() {
+    load_release
+    validate_deployment
+    [ "$(provision_state)" = ready ] || die "VM '$VM_NAME' is not ready"
+    [ "$(vm_state)" = running ] || die "VM '$VM_NAME' is not running"
+    require_command nc
+    guest_ip=$(resolve_ip 60) || die "could not resolve the bridged VM address"
+    /usr/bin/nc -z -G 5 "$guest_ip" 22 > /dev/null 2>&1 || die "SSH is not reachable at $guest_ip:22"
+    /usr/bin/nc -z -G 5 "$guest_ip" 5900 > /dev/null 2>&1 || die "Screen Sharing is not reachable at $guest_ip:5900"
+    note "ip: $guest_ip"
+    note "ssh: ssh $GUEST_USER@$guest_ip"
+    note "screen-sharing: vnc://$GUEST_USER@$guest_ip"
+}
+
+ssh_command() {
+    load_release
+    validate_deployment
+    [ "$(provision_state)" = ready ] || die "VM '$VM_NAME' is not ready for LAN access"
+    [ "$(vm_state)" = running ] || die "VM '$VM_NAME' is not running"
+    guest_ip=$(resolve_ip 60) || die "could not resolve the bridged VM address"
+    exec /usr/bin/ssh "$GUEST_USER@$guest_ip"
+}
+
+screen_command() {
+    load_release
+    validate_deployment
+    [ "$(provision_state)" = ready ] || die "VM '$VM_NAME' is not ready for LAN access"
+    [ "$(vm_state)" = running ] || die "VM '$VM_NAME' is not running"
+    guest_ip=$(resolve_ip 60) || die "could not resolve the bridged VM address"
+    exec /usr/bin/open "vnc://$GUEST_USER@$guest_ip"
+}
+
+bridge_command() {
+    load_release
+    validate_deployment
+    [ -x "$TART_BIN" ] || die "Tart is not installed; run '$PROGRAM install'"
+    case $# in
+        0)
+            note "bridge: $(bridge_interface)"
+            ;;
+        1)
+            bridge_file_was_present=false
+            if [ -e "$BRIDGE_FILE" ] || [ -L "$BRIDGE_FILE" ]; then
+                previous_bridge=$(configured_bridge_value)
+                bridge_file_was_present=true
+            else
+                previous_bridge=$(default_bridge_interface 2> /dev/null || true)
+            fi
+            service_was_loaded=false
+            if service_loaded; then
+                service_was_loaded=true
+            fi
+
+            write_bridge_interface "$1"
+            if [ "$service_was_loaded" = true ]; then
+                if ! (restart_command && wait_for_vm_running "$START_TIMEOUT"); then
+                    if service_loaded; then
+                        bootout_current_service ||
+                            die "the new bridge failed and the login service could not be unloaded"
+                    fi
+
+                    if [ "$bridge_file_was_present" = true ]; then
+                        persist_bridge_interface "$previous_bridge"
+                    else
+                        /bin/rm -f "$BRIDGE_FILE"
+                    fi
+
+                    if [ -n "$previous_bridge" ] && bridge_interface_available "$previous_bridge"; then
+                        if ! (start_command && wait_for_vm_running "$START_TIMEOUT"); then
+                            if service_loaded; then
+                                bootout_current_service > /dev/null 2>&1 || true
+                            fi
+                            note "The previous bridge was restored, but its login service could not be restarted."
+                        fi
+                    fi
+                    die "the VM did not reach running state on '$1'; restored the previous bridge configuration"
+                fi
+            fi
+            note "bridge: $1"
+            ;;
+        *) die "usage: $PROGRAM bridge [INTERFACE]" ;;
+    esac
 }
 
 logs_command() {
@@ -426,64 +863,26 @@ logs_command() {
 }
 
 uninstall_command() {
+    load_release
     validate_deployment
-    if service_loaded || { [ -x "$LUME_BIN" ] && vm_exists; }; then
+    if service_loaded || { [ -x "$TART_BIN" ] && vm_exists && [ "$(vm_state)" = running ]; }; then
         stop_command
     fi
     [ ! -e "$LAUNCH_AGENT" ] || /bin/rm -f "$LAUNCH_AGENT"
     for removal in "$ROOT/runtime" "$ROOT/bin" "$ROOT/versions"; do
         [ ! -e "$removal" ] && [ ! -L "$removal" ] || /bin/rm -R "$removal"
     done
-    note "Uninstalled GremVM runtime and launchd wiring. VM data and logs were preserved."
-}
-
-monitor_pause() {
-    /bin/sleep "$1"
-}
-
-runner_active() {
-    runner_state=$(/bin/ps -o state= -p "$1" 2> /dev/null || true)
-    case $runner_state in
-        '' | *Z*) return 1 ;;
-        *) return 0 ;;
-    esac
-}
-
-monitor_guest() {
-    runner_pid=$1
-    monitor_state=startup
-    failed_polls=0
-
-    while runner_active "$runner_pid"; do
-        if [ "$(vm_field sshAvailable 2> /dev/null || true)" = true ]; then
-            monitor_state=healthy
-            failed_polls=0
-        else
-            failed_polls=$((failed_polls + 1))
-            case $monitor_state in
-                startup)
-                    [ "$failed_polls" -lt "$GUEST_STARTUP_POLLS" ] || return 75
-                    ;;
-                healthy)
-                    [ "$failed_polls" -lt "$GUEST_FAILURE_POLLS" ] || return 75
-                    ;;
-                *) die "invalid guest monitor state: $monitor_state" ;;
-            esac
-        fi
-        monitor_pause "$GUEST_POLL_SECONDS"
-    done
+    note "Uninstalled the replaceable runtime and login wiring. Tart VM data, state, and logs were preserved."
 }
 
 stop_supervised_runner() {
     [ -n "$RUNNER_PID" ] || return 0
-    kill -TERM "$RUNNER_PID" 2> /dev/null || true
-    remaining_polls=$RUNNER_STOP_POLLS
-    while runner_active "$RUNNER_PID" && [ "$remaining_polls" -gt 0 ]; do
-        monitor_pause 1
-        remaining_polls=$((remaining_polls - 1))
-    done
-    if runner_active "$RUNNER_PID"; then
-        kill -KILL "$RUNNER_PID" 2> /dev/null || true
+    if kill -0 "$RUNNER_PID" 2> /dev/null; then
+        if vm_exists && [ "$(vm_state)" = running ]; then
+            tart stop "$VM_NAME" --timeout "$STOP_TIMEOUT" > /dev/null 2>&1 || kill -INT "$RUNNER_PID" 2> /dev/null || true
+        else
+            kill -INT "$RUNNER_PID" 2> /dev/null || true
+        fi
     fi
     wait "$RUNNER_PID" 2> /dev/null || true
     RUNNER_PID=
@@ -498,27 +897,47 @@ handle_supervisor_signal() {
 internal_supervise() {
     load_release
     validate_deployment
-    if [ "$(provision_state)" != ready ]; then
-        /bin/rm -f "$STATE_DIR/READY"
-        die "VM is not ready for managed start"
+    if ! supervisor_state=$(provision_state); then
+        die "could not read lifecycle or VM state; managed start was left unchanged"
     fi
-    firewall_ok || die "Lume's inbound firewall block is missing; refusing to start the VM"
+    if [ "$supervisor_state" = managed-vm-missing ]; then
+        quarantine_missing_ready_state
+        die "managed VM is missing; disabled managed start"
+    fi
+    [ "$supervisor_state" = ready ] || die "VM is not ready for managed start"
+    if ! bridge=$(bridge_interface); then
+        mark_start_failed_state
+        die "configured bridge is unavailable; disabled automatic retries"
+    fi
     trap handle_supervisor_signal HUP INT TERM
-    "$LUME_BIN" run "$VM_NAME" --no-display --storage "$VM_STORAGE" &
+    run_tart_vm --no-graphics --no-audio --net-bridged="$bridge" "$VM_NAME" &
     RUNNER_PID=$!
 
-    if monitor_guest "$RUNNER_PID"; then
-        set +e
-        wait "$RUNNER_PID"
-        runner_status=$?
-        set -e
-        RUNNER_PID=
-        exit "$runner_status"
+    supervisor_start_remaining=$START_TIMEOUT
+    while [ "$supervisor_start_remaining" -gt 0 ]; do
+        if [ "$(vm_state)" = running ]; then
+            break
+        fi
+        if ! kill -0 "$RUNNER_PID" 2> /dev/null; then
+            supervisor_start_remaining=0
+            break
+        fi
+        /bin/sleep 1
+        supervisor_start_remaining=$((supervisor_start_remaining - 1))
+    done
+    if [ "$supervisor_start_remaining" -eq 0 ] &&
+        { [ "$(vm_state)" != running ] || ! kill -0 "$RUNNER_PID" 2> /dev/null; }; then
+        stop_supervised_runner
+        mark_start_failed_state
+        die "Tart runner failed before the VM reached running state; disabled automatic retries"
     fi
 
-    note "Guest remained unavailable; restarting the Lume runner." >&2
-    stop_supervised_runner
-    exit 75
+    set +e
+    wait "$RUNNER_PID"
+    runner_status=$?
+    set -e
+    RUNNER_PID=
+    exit "$runner_status"
 }
 
 usage() {
@@ -526,10 +945,14 @@ usage() {
 Usage: $PROGRAM COMMAND
 
 Commands:
-  install                         Install pinned Lume and login-time launchd wiring
-  provision                       Create the fixed macOS VM and disable SIP
-  status                          Show VM service state
-  start | stop | restart          Control the VM service
+  install                         Install Nix-pinned Tart and login-time launchd wiring
+  provision                       Clone and locally harden the persistent macOS VM once
+  status                          Show VM service state and LAN address when known
+  start | stop | restart          Control the VM service for this login session
+  address                         Verify and print LAN SSH and Screen Sharing endpoints
+  ssh                             Open an SSH session from the host
+  screen                          Open macOS Screen Sharing from the host
+  bridge [INTERFACE]              Show or select the host LAN interface
   logs                            Read the most recent 200 service log lines
   uninstall                       Remove runtime and launchd wiring; preserve VM data
 EOF
@@ -562,6 +985,19 @@ case $command in
         [ "$#" -eq 0 ] || die "usage: $PROGRAM restart"
         restart_command
         ;;
+    address)
+        [ "$#" -eq 0 ] || die "usage: $PROGRAM address"
+        address_command
+        ;;
+    ssh)
+        [ "$#" -eq 0 ] || die "usage: $PROGRAM ssh"
+        ssh_command
+        ;;
+    screen)
+        [ "$#" -eq 0 ] || die "usage: $PROGRAM screen"
+        screen_command
+        ;;
+    bridge) bridge_command "$@" ;;
     logs) logs_command "$@" ;;
     uninstall)
         [ "$#" -eq 0 ] || die "usage: $PROGRAM uninstall"

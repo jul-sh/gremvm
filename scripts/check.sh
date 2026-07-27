@@ -9,5 +9,6 @@ shellcheck bin/gremvm scripts/*.sh tests/*.sh
 shfmt -d -i 4 -ci -sr bin/gremvm scripts tests
 nixfmt --check flake.nix
 bats tests
+sh tests/smoke.sh
 
 printf 'all checks passed\n'
