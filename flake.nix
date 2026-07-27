@@ -1,100 +1,171 @@
 {
-  description = "Pinned tooling for a Lume-managed persistent macOS VM";
+  description = "A persistent Tart-managed macOS VM";
 
-  inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-26.05-darwin";
-  };
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-26.05-darwin";
 
   outputs =
-    {
-      self,
-      nixpkgs,
-    }:
+    { nixpkgs, ... }:
     let
-      systems = [ "aarch64-darwin" ];
-      forAllSystems = nixpkgs.lib.genAttrs systems;
-      pkgsFor = system: nixpkgs.legacyPackages.${system};
-      vncdotoolFor =
-        system:
-        let
-          pkgs = pkgsFor system;
-        in
-        pkgs.python3Packages.buildPythonApplication rec {
-          pname = "vncdotool";
-          version = "1.3.0";
-          pyproject = true;
-          src = pkgs.fetchPypi {
-            inherit pname version;
-            hash = "sha256-Y9ObPp0JdN96937Zcc8UE4M3GlqczFIyu3rSXDMpitY=";
-          };
-          build-system = [ pkgs.python3Packages.setuptools ];
-          dependencies = with pkgs.python3Packages; [
-            cryptography
-            pillow
-            twisted
+      system = "aarch64-darwin";
+      pkgs = import nixpkgs {
+        inherit system;
+        config.allowUnfreePredicate =
+          pkg:
+          builtins.elem (nixpkgs.lib.getName pkg) [
+            "packer"
+            "tart"
           ];
-          doCheck = false;
+      };
+      projectFiles = nixpkgs.lib.fileset.unions [
+        ./Cargo.toml
+        ./Cargo.lock
+        ./LICENSE
+        ./README.md
+        ./src
+        ./tests
+        ./packer
+      ];
+      gremvmSource = nixpkgs.lib.fileset.toSource {
+        root = ./.;
+        fileset = projectFiles;
+      };
+      checkSource = nixpkgs.lib.fileset.toSource {
+        root = ./.;
+        fileset = nixpkgs.lib.fileset.union projectFiles ./flake.nix;
+      };
+      pluginVersion = "1.21.0";
+      pluginExecutable = "packer-plugin-tart_v${pluginVersion}_x5.0_darwin_arm64";
+      packerPluginTart = pkgs.stdenvNoCC.mkDerivation {
+        pname = "packer-plugin-tart";
+        version = pluginVersion;
+        src = pkgs.fetchurl {
+          url = "https://github.com/cirruslabs/packer-plugin-tart/releases/download/v${pluginVersion}/${pluginExecutable}.zip";
+          hash = "sha256-SjTKh7VANinaXKSTjpTupb8ygF+vA0ohGDViW2N9TnY=";
         };
+        nativeBuildInputs = [ pkgs.unzip ];
+        dontUnpack = true;
+        installPhase = ''
+          plugin_dir="$out/libexec/packer/plugins/github.com/cirruslabs/tart"
+          mkdir -p "$plugin_dir"
+          unzip -p "$src" > "$plugin_dir/${pluginExecutable}"
+          chmod 0755 "$plugin_dir/${pluginExecutable}"
+          sha256sum "$plugin_dir/${pluginExecutable}" \
+            | cut -d ' ' -f 1 \
+          > "$plugin_dir/${pluginExecutable}_SHA256SUM"
+        '';
+      };
+      gremvmBin = pkgs.rustPlatform.buildRustPackage {
+        pname = "gremvm";
+        version = "0.1.0";
+        src = gremvmSource;
+        cargoLock.lockFile = ./Cargo.lock;
+      };
+      gremvm = pkgs.symlinkJoin {
+        name = "gremvm";
+        paths = [
+          pkgs.tart
+          pkgs.packer
+          packerPluginTart
+        ];
+        postBuild = ''
+          install -m 0755 ${gremvmBin}/bin/gremvm "$out/bin/gremvm"
+          mkdir -p "$out/share/gremvm"
+          install -m 0644 ${./packer/gremvm.pkr.hcl} "$out/share/gremvm/gremvm.pkr.hcl"
+        '';
+        meta = {
+          description = "Manage one persistent Tart macOS VM";
+          license = pkgs.lib.licenses.mit;
+          mainProgram = "gremvm";
+          platforms = [ system ];
+        };
+      };
+      gremvmApp = {
+        type = "app";
+        program = "${gremvm}/bin/gremvm";
+        meta.description = "Manage one persistent Tart macOS VM";
+      };
     in
     {
-      packages = forAllSystems (
-        system:
-        let
-          pkgs = pkgsFor system;
-        in
-        {
-          vncdotool = vncdotoolFor system;
-        }
-      );
+      packages.${system} = {
+        default = gremvm;
+        inherit gremvm;
+      };
 
-      devShells = forAllSystems (
-        system:
-        let
-          pkgs = pkgsFor system;
-        in
-        {
-          default = pkgs.mkShellNoCC {
-            packages = [
-              pkgs.bats
-              pkgs.nixfmt
-              pkgs.shellcheck
-              pkgs.shfmt
-              (vncdotoolFor system)
-            ];
+      apps.${system} = {
+        default = gremvmApp;
+        gremvm = gremvmApp;
+      };
+
+      devShells.${system}.default = pkgs.mkShell {
+        packages = [
+          pkgs.cargo
+          pkgs.clippy
+          pkgs.nixfmt
+          pkgs.rustc
+          pkgs.rustfmt
+          gremvm
+        ];
+      };
+
+      formatter.${system} = pkgs.nixfmt;
+
+      checks.${system} = {
+        package = gremvm;
+        static = pkgs.stdenv.mkDerivation {
+          pname = "gremvm-static-checks";
+          version = "0.1.0";
+          src = checkSource;
+          cargoDeps = pkgs.rustPlatform.importCargoLock {
+            lockFile = ./Cargo.lock;
           };
-        }
-      );
-
-      formatter = forAllSystems (system: (pkgsFor system).nixfmt);
-
-      checks = forAllSystems (
-        system:
-        let
-          pkgs = pkgsFor system;
-        in
-        {
-          static =
-            pkgs.runCommand "gremvm-static-checks"
-              {
-                src = self;
-                nativeBuildInputs = [
-                  pkgs.bats
-                  pkgs.nixfmt
-                  pkgs.shellcheck
-                  pkgs.shfmt
-                ];
-              }
-              ''
-                cp -R "$src" source
-                chmod -R u+w source
-                cd source
-                shellcheck bin/gremvm scripts/*.sh tests/*.sh
-                shfmt -d -i 4 -ci -sr bin/gremvm scripts tests
-                nixfmt --check flake.nix
-                bats tests
-                touch "$out"
-              '';
-        }
-      );
+          nativeBuildInputs = [
+            pkgs.cargo
+            pkgs.clippy
+            pkgs.nixfmt
+            pkgs.packer
+            pkgs.rustPlatform.cargoSetupHook
+            pkgs.rustc
+            pkgs.rustfmt
+          ];
+          dontConfigure = true;
+          buildPhase = ''
+            runHook preBuild
+            cargo fmt --check
+            cargo clippy --all-targets --locked --offline -- -D warnings
+            cargo test --all-targets --locked --offline
+            nixfmt --check flake.nix
+            packer fmt -check packer/gremvm.pkr.hcl
+            runHook postBuild
+          '';
+          installPhase = ''
+            runHook preInstall
+            touch "$out"
+            runHook postInstall
+          '';
+        };
+        bundle = pkgs.runCommand "gremvm-bundle-check" { } ''
+          test -x ${gremvm}/bin/gremvm
+          test -x ${gremvm}/bin/tart
+          test -x ${gremvm}/bin/packer
+          test -f ${gremvm}/share/gremvm/gremvm.pkr.hcl
+          test -f ${gremvm}/libexec/packer/plugins/github.com/cirruslabs/tart/${pluginExecutable}
+          HOME="$TMPDIR/home" ${gremvm}/bin/gremvm --help >/dev/null
+          mkdir -p "$TMPDIR/home" "$TMPDIR/packer"
+          cp ${gremvm}/share/gremvm/gremvm.pkr.hcl "$TMPDIR/packer/gremvm.pkr.hcl"
+          cd "$TMPDIR/packer"
+          export HOME="$TMPDIR/home"
+          export PACKER_NO_COLOR=1
+          export PACKER_PLUGIN_PATH=${gremvm}/libexec/packer/plugins
+          export CHECKPOINT_DISABLE=1
+          PKR_VAR_vm_name=gremvm \
+            PKR_VAR_cpu_count=6 \
+            PKR_VAR_memory_gb=24 \
+            PKR_VAR_disk_size_gb=192 \
+            PKR_VAR_ssh_public_key="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest" \
+            PKR_VAR_guest_password=0123456789abcdef0123456789abcdef0123456789abcdef \
+            ${gremvm}/bin/packer validate gremvm.pkr.hcl
+          touch "$out"
+        '';
+      };
     };
 }

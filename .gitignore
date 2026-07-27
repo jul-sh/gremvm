@@ -1,8 +1,5 @@
-.direnv/
+/target
+/result
+/result-*
 .DS_Store
-result
-result-*
-
-# Local deployment state and credentials never belong in this repository.
-.gremvm/
-*.plaintext
+.direnv/

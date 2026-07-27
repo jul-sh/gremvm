@@ -1,0 +1,28 @@
+[package]
+name = "gremvm"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Manage one persistent Tart macOS VM"
+repository = "https://github.com/jul-sh/gremvm"
+readme = "README.md"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+getrandom = "0.4"
+hex = "0.4"
+libc = "0.2"
+plist = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+signal-hook = "0.4"
+tempfile = "3"
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = { version = "3", default-features = false }
+
+[profile.release]
+lto = true
+strip = true
