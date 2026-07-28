@@ -1,5 +1,5 @@
 {
-  description = "A persistent Tart-managed macOS VM";
+  description = "A persistent Lume-managed macOS VM";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-26.05-darwin";
 
@@ -7,15 +7,7 @@
     { nixpkgs, ... }:
     let
       system = "aarch64-darwin";
-      pkgs = import nixpkgs {
-        inherit system;
-        config.allowUnfreePredicate =
-          pkg:
-          builtins.elem (nixpkgs.lib.getName pkg) [
-            "packer"
-            "tart"
-          ];
-      };
+      pkgs = import nixpkgs { inherit system; };
       projectFiles = nixpkgs.lib.fileset.unions [
         ./Cargo.toml
         ./Cargo.lock
@@ -23,7 +15,7 @@
         ./README.md
         ./src
         ./tests
-        ./packer
+        ./guest
       ];
       gremvmSource = nixpkgs.lib.fileset.toSource {
         root = ./.;
@@ -33,34 +25,13 @@
         root = ./.;
         fileset = nixpkgs.lib.fileset.union projectFiles ./flake.nix;
       };
-      pluginVersion = "1.21.0";
-      pluginExecutable = "packer-plugin-tart_v${pluginVersion}_x5.0_darwin_arm64";
-      packerPluginTart = pkgs.stdenvNoCC.mkDerivation {
-        pname = "packer-plugin-tart";
-        version = pluginVersion;
+      lumeVersion = "0.4.0";
+      lume = pkgs.stdenvNoCC.mkDerivation {
+        pname = "lume";
+        version = lumeVersion;
         src = pkgs.fetchurl {
-          url = "https://github.com/cirruslabs/packer-plugin-tart/releases/download/v${pluginVersion}/${pluginExecutable}.zip";
-          hash = "sha256-SjTKh7VANinaXKSTjpTupb8ygF+vA0ohGDViW2N9TnY=";
-        };
-        nativeBuildInputs = [ pkgs.unzip ];
-        dontUnpack = true;
-        installPhase = ''
-          plugin_dir="$out/libexec/packer/plugins/github.com/cirruslabs/tart"
-          mkdir -p "$plugin_dir"
-          unzip -p "$src" > "$plugin_dir/${pluginExecutable}"
-          chmod 0755 "$plugin_dir/${pluginExecutable}"
-          sha256sum "$plugin_dir/${pluginExecutable}" \
-            | cut -d ' ' -f 1 \
-          > "$plugin_dir/${pluginExecutable}_SHA256SUM"
-        '';
-      };
-      tartVersion = "2.34.0";
-      tart = pkgs.stdenvNoCC.mkDerivation {
-        pname = "tart";
-        version = tartVersion;
-        src = pkgs.fetchurl {
-          url = "https://github.com/openai/tart/releases/download/${tartVersion}/tart.tar.gz";
-          hash = "sha256-yfFgn0lFJY7w7id91E3JcA1vBpeJoR5Dvn81sKZLMTU=";
+          url = "https://github.com/trycua/cua/releases/download/lume-v${lumeVersion}/lume-${lumeVersion}-darwin-arm64.tar.gz";
+          hash = "sha256-i0S7zFrpaT9LE0P+pYqt3dNwU/qZDNI05wPIyec7HLo=";
         };
         sourceRoot = ".";
         nativeBuildInputs = [ pkgs.makeWrapper ];
@@ -68,14 +39,23 @@
         dontFixup = true;
         installPhase = ''
           runHook preInstall
-          mkdir -p "$out/Applications" "$out/bin" "$out/share/tart"
-          cp -R tart.app "$out/Applications/tart.app"
-          makeWrapper "$out/Applications/tart.app/Contents/MacOS/tart" "$out/bin/tart"
-          install -m 0444 LICENSE "$out/share/tart/LICENSE"
+          mkdir -p "$out/Applications" "$out/bin" "$out/share/lume"
+          cp -R lume.app "$out/Applications/lume.app"
+          makeWrapper "$out/Applications/lume.app/Contents/MacOS/lume" "$out/bin/lume"
+          install -m 0444 ${
+            pkgs.fetchurl {
+              url = "https://raw.githubusercontent.com/trycua/cua/ee15ae942cefe809fd97a565220eca9c6a295ac0/LICENSE.md";
+              hash = "sha256-wHeSkMHUeDFpqj2/tV/rUF5WPvigBLv1UpjO/8+9qNk=";
+            }
+          } "$out/share/lume/LICENSE.md"
           runHook postInstall
         '';
-        meta = pkgs.tart.meta // {
-          license = pkgs.lib.licenses.fsl11Asl20;
+        meta = {
+          description = "macOS and Linux virtual machines on Apple Silicon";
+          homepage = "https://cua.ai/docs/lume";
+          license = pkgs.lib.licenses.mit;
+          mainProgram = "lume";
+          platforms = [ system ];
         };
       };
       gremvmBin = pkgs.rustPlatform.buildRustPackage {
@@ -84,32 +64,27 @@
         src = gremvmSource;
         cargoLock.lockFile = ./Cargo.lock;
       };
-      gremvm = pkgs.symlinkJoin {
-        name = "gremvm";
-        paths = [
-          pkgs.packer
-          packerPluginTart
-        ];
-        postBuild = ''
-          install -m 0755 ${gremvmBin}/bin/gremvm "$out/bin/gremvm"
-          ln -s ${tart}/bin/tart "$out/bin/tart"
-          mkdir -p "$out/Applications"
-          ln -s ${tart}/Applications/tart.app "$out/Applications/tart.app"
-          mkdir -p "$out/share/gremvm"
-          install -m 0644 ${./packer/gremvm.pkr.hcl} "$out/share/gremvm/gremvm.pkr.hcl"
-          install -m 0644 ${./packer/auto-login.pl} "$out/share/gremvm/auto-login.pl"
-        '';
-        meta = {
-          description = "Manage one persistent Tart macOS VM";
-          license = pkgs.lib.licenses.mit;
-          mainProgram = "gremvm";
-          platforms = [ system ];
-        };
-      };
+      gremvm =
+        pkgs.runCommand "gremvm"
+          {
+            meta = {
+              description = "Manage one persistent Lume macOS VM";
+              license = pkgs.lib.licenses.mit;
+              mainProgram = "gremvm";
+              platforms = [ system ];
+            };
+          }
+          ''
+            mkdir -p "$out/Applications" "$out/bin" "$out/share/gremvm"
+            ln -s ${lume}/Applications/lume.app "$out/Applications/lume.app"
+            ln -s ${lume}/bin/lume "$out/bin/lume"
+            install -m 0755 ${gremvmBin}/bin/gremvm "$out/bin/gremvm"
+            install -m 0755 ${./guest/guest-setup.sh} "$out/share/gremvm/guest-setup.sh"
+          '';
       gremvmApp = {
         type = "app";
         program = "${gremvm}/bin/gremvm";
-        meta.description = "Manage one persistent Tart macOS VM";
+        meta.description = "Manage one persistent Lume macOS VM";
       };
     in
     {
@@ -146,10 +121,10 @@
             lockFile = ./Cargo.lock;
           };
           nativeBuildInputs = [
+            pkgs.bash
             pkgs.cargo
             pkgs.clippy
             pkgs.nixfmt
-            pkgs.packer
             pkgs.rustPlatform.cargoSetupHook
             pkgs.rustc
             pkgs.rustfmt
@@ -160,8 +135,8 @@
             cargo fmt --check
             cargo clippy --all-targets --locked --offline -- -D warnings
             cargo test --all-targets --locked --offline
+            bash -n guest/guest-setup.sh
             nixfmt --check flake.nix
-            packer fmt -check packer/gremvm.pkr.hcl
             runHook postBuild
           '';
           installPhase = ''
@@ -172,29 +147,16 @@
         };
         bundle = pkgs.runCommand "gremvm-bundle-check" { } ''
           test -x ${gremvm}/bin/gremvm
-          test -x ${gremvm}/bin/tart
-          test "$(${gremvm}/bin/tart --version)" = ${tartVersion}
-          /usr/bin/codesign --verify --deep --strict ${gremvm}/Applications/tart.app
-          test -x ${gremvm}/bin/packer
-          test -f ${gremvm}/share/gremvm/gremvm.pkr.hcl
-          test -f ${gremvm}/share/gremvm/auto-login.pl
-          test -f ${gremvm}/libexec/packer/plugins/github.com/cirruslabs/tart/${pluginExecutable}
+          test -x ${gremvm}/bin/lume
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' ${gremvm}/Applications/lume.app/Contents/Info.plist)" = ${lumeVersion}
+          /usr/bin/codesign --verify --deep --strict ${gremvm}/Applications/lume.app
+          /usr/bin/codesign -d --xml --entitlements "$TMPDIR/lume-entitlements.plist" ${gremvm}/Applications/lume.app
+          test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.virtualization' "$TMPDIR/lume-entitlements.plist")" = true
+          test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.vm.networking' "$TMPDIR/lume-entitlements.plist")" = true
+          test -f ${gremvm}/Applications/lume.app/Contents/Resources/lume_lume.bundle/unattended-presets/tahoe.yml
+          test -x ${gremvm}/share/gremvm/guest-setup.sh
+          mkdir -p "$TMPDIR/home"
           HOME="$TMPDIR/home" ${gremvm}/bin/gremvm --help >/dev/null
-          mkdir -p "$TMPDIR/home" "$TMPDIR/packer"
-          cp ${gremvm}/share/gremvm/gremvm.pkr.hcl "$TMPDIR/packer/gremvm.pkr.hcl"
-          cp ${gremvm}/share/gremvm/auto-login.pl "$TMPDIR/packer/auto-login.pl"
-          cd "$TMPDIR/packer"
-          export HOME="$TMPDIR/home"
-          export PACKER_NO_COLOR=1
-          export PACKER_PLUGIN_PATH=${gremvm}/libexec/packer/plugins
-          export CHECKPOINT_DISABLE=1
-          PKR_VAR_vm_name=gremvm \
-            PKR_VAR_cpu_count=6 \
-            PKR_VAR_memory_gb=24 \
-            PKR_VAR_disk_size_gb=192 \
-            PKR_VAR_ssh_public_key="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest" \
-            PKR_VAR_guest_password=0123456789abcdef0123456789abcdef0123456789abcdef \
-            ${gremvm}/bin/packer validate gremvm.pkr.hcl
           touch "$out"
         '';
       };

@@ -3,18 +3,20 @@ name = "gremvm"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-description = "Manage one persistent Tart macOS VM"
+description = "Manage one persistent Lume macOS VM"
 repository = "https://github.com/jul-sh/gremvm"
 readme = "README.md"
 
 [dependencies]
 anyhow = "1"
+base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 getrandom = "0.4"
 hex = "0.4"
 libc = "0.2"
 nix = { version = "0.30", default-features = false, features = ["term"] }
 plist = "1"
+rpassword = "7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 signal-hook = "0.4"
