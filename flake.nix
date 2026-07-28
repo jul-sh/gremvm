@@ -71,6 +71,7 @@
           install -m 0755 ${gremvmBin}/bin/gremvm "$out/bin/gremvm"
           mkdir -p "$out/share/gremvm"
           install -m 0644 ${./packer/gremvm.pkr.hcl} "$out/share/gremvm/gremvm.pkr.hcl"
+          install -m 0644 ${./packer/auto-login.pl} "$out/share/gremvm/auto-login.pl"
         '';
         meta = {
           description = "Manage one persistent Tart macOS VM";
@@ -148,10 +149,12 @@
           test -x ${gremvm}/bin/tart
           test -x ${gremvm}/bin/packer
           test -f ${gremvm}/share/gremvm/gremvm.pkr.hcl
+          test -f ${gremvm}/share/gremvm/auto-login.pl
           test -f ${gremvm}/libexec/packer/plugins/github.com/cirruslabs/tart/${pluginExecutable}
           HOME="$TMPDIR/home" ${gremvm}/bin/gremvm --help >/dev/null
           mkdir -p "$TMPDIR/home" "$TMPDIR/packer"
           cp ${gremvm}/share/gremvm/gremvm.pkr.hcl "$TMPDIR/packer/gremvm.pkr.hcl"
+          cp ${gremvm}/share/gremvm/auto-login.pl "$TMPDIR/packer/auto-login.pl"
           cd "$TMPDIR/packer"
           export HOME="$TMPDIR/home"
           export PACKER_NO_COLOR=1

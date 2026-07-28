@@ -1,6 +1,10 @@
+use std::io::Write;
+use std::process::{Command, Stdio};
+
 #[test]
 fn packer_template_pins_the_image_and_preserves_recovery() {
     let packer = include_str!("../packer/gremvm.pkr.hcl");
+    let auto_login = include_str!("../packer/auto-login.pl");
     let image = packer
         .lines()
         .find(|line| line.trim_start().starts_with("vm_base_name"))
@@ -14,5 +18,36 @@ fn packer_template_pins_the_image_and_preserves_recovery() {
     assert!(packer.contains("headless           = true"));
     assert!(packer.contains("systemsetup -setremotelogin on"));
     assert!(packer.contains("PasswordAuthentication no"));
+    assert!(packer.contains("/usr/bin/perl /tmp/gremvm-auto-login.pl"));
+    assert!(packer.contains("autoLoginUser admin"));
+    assert!(auto_login.contains("<STDIN>"));
     assert!(packer.contains("socketfilterfw --setglobalstate off"));
+}
+
+#[test]
+fn auto_login_encoder_reads_the_password_from_stdin() {
+    let mut child = Command::new("/usr/bin/perl")
+        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/packer/auto-login.pl"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"admin").unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(
+        output.stdout,
+        hex::decode("1ced3f4abcbcddeaa3b91f7d").unwrap()
+    );
+}
+
+#[test]
+fn background_and_gui_runs_are_suspendable() {
+    let driver = include_str!("../src/lib.rs");
+
+    assert_eq!(driver.matches("\"--suspendable\"").count(), 2);
+    assert!(driver.contains(".args([\"suspend\", &self.config.vm_name])"));
+    assert!(driver.contains("Command::new(\"/usr/bin/caffeinate\")"));
+    assert!(driver.contains("background restart was withheld to avoid a cold boot"));
 }

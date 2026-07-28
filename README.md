@@ -13,7 +13,8 @@ GremVM approximates this with [Tart](https://tart.run/): a persistent macOS Taho
 ## Behavior
 
 - After a host reboot, SSH into host and run `gremvm start`.
-- The VM continues running after SSH disconnects and restarts after guest shutdowns or Tart failures.
+- In background mode, the VM continues running after SSH disconnects and restarts after guest shutdowns or Tart failures.
+- Switching between background and host-console operation preserves the live guest session.
 - The guest appears as a normal machine on the LAN, reachable through SSH and Screen Sharing.
 - A graphical login on the host is not required.
 
@@ -26,7 +27,7 @@ GremVM approximates this with [Tart](https://tart.run/): a persistent macOS Taho
 - An encrypted APFS volume only when using `--volume-name`
 - An active `en0` interface connected to the LAN
 - At least the configured CPU count and more memory than the guest allocation
-- Enough host storage for provisioning data and subsequent VM disk growth
+- Enough host storage for provisioning, VM disk growth, and a suspend image that can approach the configured guest memory
 
 On macOS 15 and later, Tart requires the host account's login Keychain to be unlocked when a VM starts. See [Tart's headless-machine guidance](https://tart.run/faq/#headless-machines).
 
@@ -116,11 +117,13 @@ Retrieve the `admin` password from the host Keychain:
 security find-generic-password -a admin -s io.gremvm.tart.gui-password -w
 ```
 
-The generated password is stored in the host Keychain and used for both guest login and the guest login Keychain. Password rotation is unsupported; the host and guest copies must remain synchronized.
+The generated password is stored in the host Keychain and used for both guest login and the guest login Keychain. The guest automatically logs `admin` in after boot; the password is still required to authenticate a Screen Sharing connection. Password rotation is unsupported because the host and guest copies must remain synchronized.
 
-`gremvm gui` is different: it opens Tart's console on the host. It must be invoked from a graphical host session and returns a clear error from SSH or another Background session, even if the same account is logged in graphically elsewhere. When available, it temporarily stops the background instance and restores background supervision when the console closes if the VM was previously enabled.
+`gremvm gui` is different: it opens Tart's console on the host. It must be invoked from that user's unlocked, on-console graphical session and returns a clear error from SSH, a locked session, or another Background session. GremVM uses [Tart's suspendable mode](https://tart.run/blog/2023/09/20/tart-200-and-community-updates/) to save the running VM, resume the same session in the console, save it again when the console closes, and restore background supervision when it was previously enabled. It prevents idle display and system sleep while the console is open because macOS needs the unlocked graphical session to encrypt the saved state. Do not manually lock or log out of the host until the handoff completes.
 
-Security note: provisioning disables the macOS application firewall in the guest. Any enabled service bound to a non-loopback interface is directly reachable from the LAN, subject only to network-level filtering or client isolation.
+An already running guest does not reboot during a successful handoff; a stopped VM has no live state to preserve and cold-boots. If Tart cannot produce a verified saved state, GremVM leaves automatic background restart disabled rather than silently cold-booting the guest. Inspect the error and run `gremvm start` when a cold boot is acceptable.
+
+Security note: provisioning disables the macOS application firewall in the guest. Any enabled service bound to a non-loopback interface is directly reachable from the LAN, subject only to network-level filtering or client isolation. Automatic login requires guest FileVault to remain off and stores a reversible login secret in the guest's `/etc/kcpassword` file.
 
 The `ssh` command uses the dedicated private key stored on the host. To connect over SSH from another computer, add that computer's public key to `/Users/admin/.ssh/authorized_keys` in the guest.
 

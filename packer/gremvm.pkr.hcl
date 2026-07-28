@@ -49,6 +49,11 @@ source "tart-cli" "gremvm" {
 build {
   sources = ["source.tart-cli.gremvm"]
 
+  provisioner "file" {
+    source      = "${path.root}/auto-login.pl"
+    destination = "/tmp/gremvm-auto-login.pl"
+  }
+
   provisioner "shell" {
     environment_vars = [
       "GREMVM_SSH_PUBLIC_KEY=${var.ssh_public_key}",
@@ -65,9 +70,10 @@ build {
       "grep -q '^PasswordAuthentication no$' /etc/ssh/sshd_config || printf '%s\\n' 'PasswordAuthentication no' | sudo tee -a /etc/ssh/sshd_config >/dev/null",
       "sudo sysadminctl -adminUser admin -adminPassword admin -resetPasswordFor admin -newPassword \"$GREMVM_GUEST_PASSWORD\"",
       "printf '%s\\n' \"set-keychain-password -o admin -p $GREMVM_GUEST_PASSWORD /Users/admin/Library/Keychains/login.keychain-db\" | security -i",
-      # The source image's auto-login secret is invalid after changing the password.
-      "sudo defaults delete /Library/Preferences/com.apple.loginwindow autoLoginUser || true",
-      "sudo rm -f /etc/kcpassword",
+      "set -o pipefail; printf '%s' \"$GREMVM_GUEST_PASSWORD\" | /usr/bin/perl /tmp/gremvm-auto-login.pl | sudo /bin/sh -c 'set -e; rm -f /etc/kcpassword; umask 077; touch /etc/kcpassword; chown root:wheel /etc/kcpassword; chmod 0600 /etc/kcpassword; cat > /etc/kcpassword'",
+      "sudo defaults write /Library/Preferences/com.apple.loginwindow autoLoginUser admin",
+      "sudo defaults write /Library/Preferences/com.apple.loginwindow autoLoginUserScreenLocked -bool false",
+      "sudo rm /tmp/gremvm-auto-login.pl",
       "sudo /usr/libexec/ApplicationFirewall/socketfilterfw --setglobalstate off",
     ]
   }

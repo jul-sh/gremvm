@@ -215,8 +215,8 @@ impl Paths {
 
 #[derive(Deserialize)]
 struct VmInfo {
-    #[serde(rename = "Running")]
-    running: bool,
+    #[serde(rename = "State")]
+    state: VmState,
     #[serde(rename = "CPU")]
     cpu: u32,
     #[serde(rename = "Memory")]
@@ -225,6 +225,19 @@ struct VmInfo {
     disk: u64,
     #[serde(rename = "OS")]
     os: String,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum VmState {
+    Running,
+    Suspended,
+    Stopped,
+}
+
+enum GuiSource {
+    Snapshot,
+    ColdBoot,
 }
 
 #[derive(Deserialize)]
@@ -237,6 +250,26 @@ struct VolumeInfo {
     #[serde(rename = "VolumeUUID")]
     volume_uuid: String,
     writable_volume: bool,
+}
+
+#[derive(Deserialize)]
+struct ConsoleInfo {
+    #[serde(rename = "IOConsoleLocked", default)]
+    locked: bool,
+    #[serde(rename = "IOConsoleUsers")]
+    users: Vec<ConsoleSession>,
+}
+
+#[derive(Deserialize)]
+struct ConsoleSession {
+    #[serde(rename = "kCGSSessionUserIDKey")]
+    user_id: u32,
+    #[serde(rename = "kCGSSessionOnConsoleKey", default)]
+    on_console: bool,
+    #[serde(rename = "kCGSessionLoginDoneKey", default)]
+    login_done: bool,
+    #[serde(rename = "CGSSessionScreenIsLocked", default)]
+    screen_locked: bool,
 }
 
 #[derive(Serialize)]
@@ -453,6 +486,7 @@ impl App {
             "bin/tart",
             "bin/packer",
             "share/gremvm/gremvm.pkr.hcl",
+            "share/gremvm/auto-login.pl",
         ] {
             ensure!(
                 bundle.join(file).is_file(),
@@ -1074,33 +1108,128 @@ impl App {
     fn stop_vm(&self) -> Result<()> {
         self.clear_keychain_helper()?;
         remove_if_present(&self.paths.run_marker)?;
-        self.suspend_vm()
+        self.stop_tart()
     }
 
-    fn suspend_vm(&self) -> Result<()> {
-        let target = service_target();
-        if self.service_loaded(&target)? {
-            self.launchctl(&["bootout", &target], "unload the service")?;
-        }
+    fn stop_tart(&self) -> Result<()> {
         let storage_mounted = match &self.config.storage {
             Storage::Default => true,
             Storage::Volume { name, uuid } => self.volume_mounted(name, uuid)?,
         };
-        if is_executable(&self.paths.bin("tart"))
-            && storage_mounted
-            && self.vm_exists()?
-            && self.vm_info()?.running
-        {
-            let result = success(
-                self.tart()?
-                    .args(["stop", &self.config.vm_name, "--timeout", "30"]),
-                "stop the VM",
-            );
-            if result.is_err() && self.vm_info()?.running {
-                result?;
+        let manageable =
+            is_executable(&self.paths.bin("tart")) && storage_mounted && self.vm_exists()?;
+        let stop_error = if manageable {
+            match self.vm_info()?.state {
+                VmState::Running | VmState::Suspended => success(
+                    self.tart()?
+                        .args(["stop", &self.config.vm_name, "--timeout", "30"]),
+                    "stop the VM",
+                )
+                .err(),
+                VmState::Stopped => None,
+            }
+        } else {
+            None
+        };
+        let target = service_target();
+        if self.service_loaded(&target)? {
+            self.launchctl(&["bootout", &target], "unload the service")?;
+        }
+        if manageable {
+            match self.vm_info()?.state {
+                VmState::Stopped => {}
+                VmState::Running | VmState::Suspended => {
+                    if let Some(error) = stop_error {
+                        return Err(error);
+                    }
+                    bail!("the VM did not stop");
+                }
             }
         }
         Ok(())
+    }
+
+    fn prepare_gui(&self, resume_background: bool) -> Result<()> {
+        remove_if_present(&self.paths.run_marker)?;
+        let source = match self.vm_info()?.state {
+            VmState::Running => {
+                success(
+                    self.tart()?.args(["suspend", &self.config.vm_name]),
+                    "suspend the VM",
+                )?;
+                let deadline = Instant::now() + Duration::from_secs(300);
+                loop {
+                    match self.vm_info()?.state {
+                        VmState::Suspended => break,
+                        VmState::Stopped => bail!("the VM stopped before Tart could suspend it"),
+                        VmState::Running => ensure!(
+                            Instant::now() < deadline,
+                            "timed out waiting for the VM to suspend"
+                        ),
+                    }
+                    thread::sleep(Duration::from_millis(500));
+                }
+                GuiSource::Snapshot
+            }
+            VmState::Suspended => GuiSource::Snapshot,
+            VmState::Stopped if resume_background => {
+                bail!("the background VM stopped before it could be suspended")
+            }
+            VmState::Stopped => GuiSource::ColdBoot,
+        };
+        let target = service_target();
+        if self.service_loaded(&target)? {
+            self.launchctl(&["bootout", &target], "unload the service")?;
+        }
+        match (source, self.vm_info()?.state) {
+            (GuiSource::Snapshot, VmState::Suspended) | (GuiSource::ColdBoot, VmState::Stopped) => {
+                Ok(())
+            }
+            (GuiSource::Snapshot, VmState::Running | VmState::Stopped) => {
+                bail!("the VM snapshot was lost during the background handoff")
+            }
+            (GuiSource::ColdBoot, VmState::Running | VmState::Suspended) => {
+                bail!("the VM changed state during the GUI handoff")
+            }
+        }
+    }
+
+    fn suspend_gui_process(
+        &self,
+        child: &mut std::process::Child,
+    ) -> Result<std::process::ExitStatus> {
+        let deadline = Instant::now() + Duration::from_secs(300);
+        loop {
+            if let Some(status) = child.try_wait()? {
+                return Ok(status);
+            }
+            let sent = match self.tart() {
+                Ok(mut suspend) => suspend
+                    .process_group(0)
+                    .args(["suspend", &self.config.vm_name])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .is_ok_and(|status| status.success()),
+                Err(_) => false,
+            };
+            if sent {
+                break;
+            }
+            if Instant::now() >= deadline {
+                bail!("timed out asking Tart to suspend the GUI VM; Tart was left running");
+            }
+            thread::sleep(Duration::from_millis(250));
+        }
+        loop {
+            if let Some(status) = child.try_wait()? {
+                return Ok(status);
+            }
+            if Instant::now() >= deadline {
+                bail!("timed out waiting for the GUI VM to suspend; Tart was left running");
+            }
+            thread::sleep(Duration::from_millis(250));
+        }
     }
 
     fn wait_for_ssh(&self, ip_wait: u32) -> Result<String> {
@@ -1111,6 +1240,7 @@ impl App {
             probe
                 .args(["-o", "ConnectTimeout=5", "-o", "ConnectionAttempts=1"])
                 .arg("/usr/bin/true")
+                .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
             if probe.status()?.success() {
@@ -1154,54 +1284,82 @@ impl App {
     }
 
     fn gui(&self) -> Result<()> {
-        ensure!(
-            launchd_session()? == "Aqua",
-            "gremvm gui requires an active graphical host session; use Screen Sharing to the guest instead"
-        );
+        ensure_gui_session()?;
         self.clear_keychain_helper()?;
         self.ensure_keychain(KeychainMode::Current)?;
-        if self.paths.run_marker.exists() {
+        let resume_background = self.paths.run_marker.exists();
+        if resume_background {
             self.ensure_keychain(KeychainMode::BackgroundInteractive)?;
         }
         self.ensure_storage()?;
         ensure!(self.vm_exists()?, "VM does not exist");
         validate_bridge()?;
-        let gui = (|| {
-            self.suspend_vm()?;
-            let mut signals = Signals::new(TERM_SIGNALS.iter().copied().chain([SIGHUP]))?;
-            let handle = signals.handle();
-            let mut stop = self.tart()?;
-            let vm_name = self.config.vm_name.clone();
-            let watcher = thread::spawn(move || {
-                if signals.forever().next().is_some() {
-                    let _ = stop.args(["stop", &vm_name, "--timeout", "30"]).status();
+        if resume_background {
+            match self.vm_info()?.state {
+                VmState::Running => {}
+                VmState::Suspended | VmState::Stopped => {
+                    self.start_service()?;
+                    self.wait_for_ssh(300)?;
                 }
-            });
-            let status = self
-                .tart()?
-                .args([
-                    "run",
-                    &format!("--net-bridged={BRIDGE}"),
-                    &self.config.vm_name,
-                ])
-                .status()?;
-            handle.close();
-            let _ = watcher.join();
-            ensure!(status.success(), "Tart exited with {status}");
-            Ok(())
-        })();
-        let restart = if self.paths.run_marker.exists() {
-            self.start()
-        } else {
-            Ok(())
-        };
-        match (gui, restart) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
-            (Err(error), Err(restart)) => {
-                Err(error.context(format!("background restart also failed: {restart:#}")))
             }
         }
+        let mut signals = Signals::new(TERM_SIGNALS.iter().copied().chain([SIGHUP]))?;
+        let gui = (|| {
+            ensure_gui_session()?;
+            self.prepare_gui(resume_background)?;
+            ensure_gui_session()?;
+            ensure!(
+                signals.pending().next().is_none(),
+                "GUI launch was interrupted"
+            );
+            let mut run = Command::new("/usr/bin/caffeinate");
+            self.configure_tart_storage(&mut run)?;
+            run.process_group(0).args([
+                "-disu",
+                self.paths
+                    .bin("tart")
+                    .to_str()
+                    .context("Tart path is not UTF-8")?,
+                "run",
+                "--suspendable",
+                &format!("--net-bridged={BRIDGE}"),
+                &self.config.vm_name,
+            ]);
+            let mut child = run.spawn()?;
+            thread::sleep(Duration::from_millis(250));
+            let status = loop {
+                if let Some(status) = child.try_wait()? {
+                    break status;
+                }
+                if signals.pending().next().is_some() {
+                    ensure_gui_session()?;
+                    break self.suspend_gui_process(&mut child)?;
+                }
+                thread::sleep(Duration::from_millis(100));
+            };
+            ensure!(status.success(), "Tart exited with {status}");
+            ensure!(
+                matches!(self.vm_info()?.state, VmState::Suspended),
+                "the GUI VM exited without a saved state"
+            );
+            Ok(())
+        })();
+        drop(signals);
+        if let Err(error) = gui {
+            return if resume_background {
+                Err(error.context(
+                    "background restart was withheld to avoid a cold boot; inspect the VM, then run 'gremvm start' when ready",
+                ))
+            } else {
+                Err(error)
+            };
+        }
+        if resume_background {
+            touch(&self.paths.run_marker)?;
+            self.start_service()?;
+            println!("running: admin@{}", self.wait_for_ssh(300)?);
+        }
+        Ok(())
     }
 
     fn status(&self) -> Result<()> {
@@ -1210,13 +1368,18 @@ impl App {
             return Ok(());
         }
         let vm = self.vm_info()?;
-        let ip = if vm.running { self.vm_ip(0).ok() } else { None };
-        let state = match (vm.running, ip.as_deref(), self.paths.run_marker.exists()) {
+        let ip = match vm.state {
+            VmState::Running => self.vm_ip(0).ok(),
+            VmState::Suspended | VmState::Stopped => None,
+        };
+        let state = match (vm.state, ip.as_deref(), self.paths.run_marker.exists()) {
             (_, _, _) if !self.paths.provisioned.exists() => "incomplete",
-            (true, Some(_), _) => "running",
-            (true, None, _) => "running-address-unknown",
-            (false, _, true) => "starting",
-            (false, _, false) => "stopped",
+            (VmState::Running, Some(_), _) => "running",
+            (VmState::Running, None, _) => "running-address-unknown",
+            (VmState::Suspended, _, true) => "starting",
+            (VmState::Suspended, _, false) => "suspended",
+            (VmState::Stopped, _, true) => "starting",
+            (VmState::Stopped, _, false) => "stopped",
         };
         println!("state: {state}");
         if let Some(ip) = ip {
@@ -1278,6 +1441,7 @@ impl App {
         command.args([
             "run",
             "--no-graphics",
+            "--suspendable",
             &format!("--net-bridged={BRIDGE}"),
             &self.config.vm_name,
         ]);
@@ -1460,6 +1624,31 @@ fn launchd_session() -> Result<String> {
         Command::new("/bin/launchctl").arg("managername"),
         "inspect the launchd session",
     )
+}
+
+fn ensure_gui_session() -> Result<()> {
+    ensure!(
+        launchd_session()? == "Aqua",
+        "gremvm gui requires an active graphical host session; use Screen Sharing to the guest instead"
+    );
+    let output = Command::new("/usr/sbin/ioreg")
+        .args(["-n", "Root", "-d1", "-a"])
+        .output()
+        .context("cannot inspect the graphical host session")?;
+    check_output(&output, "inspect the graphical host session")?;
+    let console: ConsoleInfo = plist::from_bytes(&output.stdout)
+        .context("ioreg returned malformed graphical session information")?;
+    let uid = unsafe { libc::getuid() };
+    let session = console
+        .users
+        .into_iter()
+        .find(|session| session.user_id == uid && session.on_console)
+        .context("the current user has no on-console graphical host session")?;
+    ensure!(
+        !console.locked && session.login_done && !session.screen_locked,
+        "gremvm gui requires this user's on-console graphical session to be unlocked so macOS can encrypt the VM snapshot"
+    );
+    Ok(())
 }
 
 fn service_target() -> String {

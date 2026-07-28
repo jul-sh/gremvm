@@ -247,3 +247,34 @@ fn default_storage_uses_tarts_normal_home() {
         .success()
         .stdout("state: not-provisioned\n");
 }
+
+#[test]
+fn suspended_vm_status_is_reported() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("Library/Application Support/GremVM");
+    let config = root.join("config");
+    let state = root.join("state");
+    let tart = root.join("runtime/bin/tart");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::create_dir_all(tart.parent().unwrap()).unwrap();
+    std::fs::write(
+        config.join("config.json"),
+        r#"{"vm_name":"gremvm","cpu_count":6,"memory_gb":24,"disk_gb":192,"storage":{"kind":"default"}}"#,
+    )
+    .unwrap();
+    std::fs::write(state.join("provisioned"), "").unwrap();
+    std::fs::write(
+        &tart,
+        "#!/bin/sh\ncase \"$1\" in\nlist) echo gremvm;;\nget) echo '{\"State\":\"suspended\",\"CPU\":6,\"Memory\":24576,\"Disk\":192,\"OS\":\"darwin\"}';;\n*) exit 1;;\nesac\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&tart, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    cargo_bin_cmd!("gremvm")
+        .env("HOME", home.path())
+        .arg("status")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("state: suspended\n"));
+}
