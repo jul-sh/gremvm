@@ -50,8 +50,10 @@ enum Action {
         #[arg(num_args = 0.., trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<OsString>,
     },
-    /// Temporarily open Tart's graphical console.
-    Gui,
+    /// Open the guest in macOS Screen Sharing.
+    ScreenShare,
+    /// Open Tart's local recovery console.
+    Console,
     /// Show VM logs.
     Logs {
         #[arg(long)]
@@ -235,7 +237,7 @@ enum VmState {
     Stopped,
 }
 
-enum GuiSource {
+enum ConsoleSource {
     Snapshot,
     ColdBoot,
 }
@@ -369,7 +371,7 @@ pub fn run() -> Result<()> {
         | Action::Start
         | Action::Stop
         | Action::Restart
-        | Action::Gui
+        | Action::Console
         | Action::Uninstall => Some(management_lock(&paths)?),
         _ => None,
     };
@@ -408,7 +410,8 @@ impl App {
             Action::Stop => self.stop(),
             Action::Restart => self.restart(),
             Action::Ssh { command } => self.ssh(&command),
-            Action::Gui => self.gui(),
+            Action::ScreenShare => self.screen_share(),
+            Action::Console => self.console(),
             Action::Logs { follow } => self.logs(follow),
             Action::Uninstall => self.uninstall(),
             Action::InternalRun => self.internal_run(),
@@ -1149,7 +1152,7 @@ impl App {
         Ok(())
     }
 
-    fn prepare_gui(&self, resume_background: bool) -> Result<()> {
+    fn prepare_console(&self, resume_background: bool) -> Result<()> {
         remove_if_present(&self.paths.run_marker)?;
         let source = match self.vm_info()?.state {
             VmState::Running => {
@@ -1169,32 +1172,31 @@ impl App {
                     }
                     thread::sleep(Duration::from_millis(500));
                 }
-                GuiSource::Snapshot
+                ConsoleSource::Snapshot
             }
-            VmState::Suspended => GuiSource::Snapshot,
+            VmState::Suspended => ConsoleSource::Snapshot,
             VmState::Stopped if resume_background => {
                 bail!("the background VM stopped before it could be suspended")
             }
-            VmState::Stopped => GuiSource::ColdBoot,
+            VmState::Stopped => ConsoleSource::ColdBoot,
         };
         let target = service_target();
         if self.service_loaded(&target)? {
             self.launchctl(&["bootout", &target], "unload the service")?;
         }
         match (source, self.vm_info()?.state) {
-            (GuiSource::Snapshot, VmState::Suspended) | (GuiSource::ColdBoot, VmState::Stopped) => {
-                Ok(())
-            }
-            (GuiSource::Snapshot, VmState::Running | VmState::Stopped) => {
+            (ConsoleSource::Snapshot, VmState::Suspended)
+            | (ConsoleSource::ColdBoot, VmState::Stopped) => Ok(()),
+            (ConsoleSource::Snapshot, VmState::Running | VmState::Stopped) => {
                 bail!("the VM snapshot was lost during the background handoff")
             }
-            (GuiSource::ColdBoot, VmState::Running | VmState::Suspended) => {
-                bail!("the VM changed state during the GUI handoff")
+            (ConsoleSource::ColdBoot, VmState::Running | VmState::Suspended) => {
+                bail!("the VM changed state during the console handoff")
             }
         }
     }
 
-    fn suspend_gui_process(
+    fn suspend_console_process(
         &self,
         child: &mut std::process::Child,
     ) -> Result<std::process::ExitStatus> {
@@ -1217,7 +1219,7 @@ impl App {
                 break;
             }
             if Instant::now() >= deadline {
-                bail!("timed out asking Tart to suspend the GUI VM; Tart was left running");
+                bail!("timed out asking Tart to suspend the console VM; Tart was left running");
             }
             thread::sleep(Duration::from_millis(250));
         }
@@ -1226,7 +1228,7 @@ impl App {
                 return Ok(status);
             }
             if Instant::now() >= deadline {
-                bail!("timed out waiting for the GUI VM to suspend; Tart was left running");
+                bail!("timed out waiting for the console VM to suspend; Tart was left running");
             }
             thread::sleep(Duration::from_millis(250));
         }
@@ -1283,8 +1285,30 @@ impl App {
         Err(anyhow!("cannot execute ssh: {}", command.exec()))
     }
 
-    fn gui(&self) -> Result<()> {
-        ensure_gui_session()?;
+    fn screen_share(&self) -> Result<()> {
+        self.ensure_storage()?;
+        ensure!(
+            self.vm_exists()?,
+            "VM does not exist; run 'gremvm provision'"
+        );
+        match self.vm_info()?.state {
+            VmState::Running => {}
+            VmState::Suspended | VmState::Stopped => {
+                bail!("VM is not running; run 'gremvm start'")
+            }
+        }
+        let ip = self.vm_ip(120)?;
+        ensure_graphical_session("screen-share")?;
+        success(
+            Command::new("/usr/bin/open").arg(format!("vnc://{ip}")),
+            "open guest Screen Sharing",
+        )?;
+        println!("screen sharing: admin@{ip}");
+        Ok(())
+    }
+
+    fn console(&self) -> Result<()> {
+        ensure_console_session()?;
         self.clear_keychain_helper()?;
         self.ensure_keychain(KeychainMode::Current)?;
         let resume_background = self.paths.run_marker.exists();
@@ -1304,13 +1328,13 @@ impl App {
             }
         }
         let mut signals = Signals::new(TERM_SIGNALS.iter().copied().chain([SIGHUP]))?;
-        let gui = (|| {
-            ensure_gui_session()?;
-            self.prepare_gui(resume_background)?;
-            ensure_gui_session()?;
+        let console = (|| {
+            ensure_console_session()?;
+            self.prepare_console(resume_background)?;
+            ensure_console_session()?;
             ensure!(
                 signals.pending().next().is_none(),
-                "GUI launch was interrupted"
+                "console launch was interrupted"
             );
             let mut run = Command::new("/usr/bin/caffeinate");
             self.configure_tart_storage(&mut run)?;
@@ -1332,20 +1356,20 @@ impl App {
                     break status;
                 }
                 if signals.pending().next().is_some() {
-                    ensure_gui_session()?;
-                    break self.suspend_gui_process(&mut child)?;
+                    ensure_console_session()?;
+                    break self.suspend_console_process(&mut child)?;
                 }
                 thread::sleep(Duration::from_millis(100));
             };
             ensure!(status.success(), "Tart exited with {status}");
             ensure!(
                 matches!(self.vm_info()?.state, VmState::Suspended),
-                "the GUI VM exited without a saved state"
+                "the console VM exited without a saved state"
             );
             Ok(())
         })();
         drop(signals);
-        if let Err(error) = gui {
+        if let Err(error) = console {
             return if resume_background {
                 Err(error.context(
                     "background restart was withheld to avoid a cold boot; inspect the VM, then run 'gremvm start' when ready",
@@ -1626,11 +1650,16 @@ fn launchd_session() -> Result<String> {
     )
 }
 
-fn ensure_gui_session() -> Result<()> {
+fn ensure_graphical_session(command: &str) -> Result<()> {
     ensure!(
         launchd_session()? == "Aqua",
-        "gremvm gui requires an active graphical host session; use Screen Sharing to the guest instead"
+        "gremvm {command} requires an active graphical host session"
     );
+    Ok(())
+}
+
+fn ensure_console_session() -> Result<()> {
+    ensure_graphical_session("console")?;
     let output = Command::new("/usr/sbin/ioreg")
         .args(["-n", "Root", "-d1", "-a"])
         .output()
@@ -1646,7 +1675,7 @@ fn ensure_gui_session() -> Result<()> {
         .context("the current user has no on-console graphical host session")?;
     ensure!(
         !console.locked && session.login_done && !session.screen_locked,
-        "gremvm gui requires this user's on-console graphical session to be unlocked so macOS can encrypt the VM snapshot"
+        "gremvm console requires this user's on-console graphical session to be unlocked so macOS can encrypt the VM snapshot"
     );
     Ok(())
 }

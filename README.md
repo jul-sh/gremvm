@@ -14,7 +14,8 @@ GremVM approximates this with [Tart](https://tart.run/): a persistent macOS Taho
 
 - After a host reboot, SSH into host and run `gremvm start`.
 - In background mode, the VM continues running after SSH disconnects and restarts after guest shutdowns or Tart failures.
-- Switching between background and host-console operation preserves the live guest session.
+- Normal Screen Sharing does not change the VM lifecycle.
+- Opening Tart's recovery console preserves the live guest session.
 - The guest appears as a normal machine on the LAN, reachable through SSH and Screen Sharing.
 - A graphical login on the host is not required.
 
@@ -91,7 +92,8 @@ The first install saves settings in `~/Library/Application Support/GremVM/config
 gremvm status
 gremvm ssh
 gremvm ssh sw_vers
-gremvm gui
+gremvm screen-share
+gremvm console
 gremvm stop
 gremvm start
 gremvm restart
@@ -101,7 +103,7 @@ gremvm uninstall
 
 `stop` removes the run marker, unloads the user-domain service, and stops the VM. Automatic restart remains disabled until `start` is called. `restart`, `status`, `ssh`, and `logs` work from SSH.
 
-## Guest Screen Sharing and the host console
+## Guest Screen Sharing and the recovery console
 
 The guest receives its own DHCP address on the `en0` network, which `status` reports when available. There is no NAT or port-forwarding layer.
 
@@ -111,6 +113,14 @@ The pinned base image enables Screen Sharing. Because the connection goes direct
 open 'vnc://GUEST_IP'
 ```
 
+From a graphical session on the host, the convenience command resolves the same guest IP and opens it in macOS Screen Sharing:
+
+```sh
+gremvm screen-share
+```
+
+Opening or closing Screen Sharing does not start, stop, suspend, or restart the VM. Use it for normal desktop access.
+
 Retrieve the `admin` password from the host Keychain:
 
 ```sh
@@ -119,7 +129,7 @@ security find-generic-password -a admin -s io.gremvm.tart.gui-password -w
 
 The generated password is stored in the host Keychain and used for both guest login and the guest login Keychain. The guest automatically logs `admin` in after boot; the password is still required to authenticate a Screen Sharing connection. Password rotation is unsupported because the host and guest copies must remain synchronized.
 
-`gremvm gui` is different: it opens Tart's console on the host. It must be invoked from that user's unlocked, on-console graphical session and returns a clear error from SSH, a locked session, or another Background session. GremVM uses [Tart's suspendable mode](https://tart.run/blog/2023/09/20/tart-200-and-community-updates/) to save the running VM, resume the same session in the console, save it again when the console closes, and restore background supervision when it was previously enabled. It prevents idle display and system sleep while the console is open because macOS needs the unlocked graphical session to encrypt the saved state. Do not manually lock or log out of the host until the handoff completes.
+`gremvm console` is the recovery path for guest boot, networking, or Screen Sharing failures. It opens Tart's local console on the host and must be invoked from that user's unlocked, on-console graphical session. It returns a clear error from SSH, a locked session, or another Background session. GremVM uses [Tart's suspendable mode](https://tart.run/blog/2023/09/20/tart-200-and-community-updates/) to save the running VM, resume the same session in the console, save it again when the console closes, and restore background supervision when it was previously enabled. It prevents idle display and system sleep while the console is open because macOS needs the unlocked graphical session to encrypt the saved state. Do not manually lock or log out of the host until the handoff completes.
 
 An already running guest does not reboot during a successful handoff; a stopped VM has no live state to preserve and cold-boots. If Tart cannot produce a verified saved state, GremVM leaves automatic background restart disabled rather than silently cold-booting the guest. Inspect the error and run `gremvm start` when a cold boot is acceptable.
 

@@ -43,11 +43,19 @@ fn auto_login_encoder_reads_the_password_from_stdin() {
 }
 
 #[test]
-fn background_and_gui_runs_are_suspendable() {
+fn background_and_console_runs_are_suspendable() {
     let driver = include_str!("../src/lib.rs");
 
     assert_eq!(driver.matches("\"--suspendable\"").count(), 2);
     assert!(driver.contains(".args([\"suspend\", &self.config.vm_name])"));
     assert!(driver.contains("Command::new(\"/usr/bin/caffeinate\")"));
     assert!(driver.contains("background restart was withheld to avoid a cold boot"));
+}
+
+#[test]
+fn screen_sharing_uses_the_guest_ip() {
+    let driver = include_str!("../src/lib.rs");
+
+    assert!(driver.contains("Command::new(\"/usr/bin/open\").arg(format!(\"vnc://{ip}\"))"));
+    assert!(driver.contains("Action::ScreenShare => self.screen_share()"));
 }

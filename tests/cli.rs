@@ -38,6 +38,13 @@ fn help_describes_the_public_interface() {
         .stdout(predicate::str::contains(
             "The guest always uses bridged networking on en0.",
         ))
+        .stdout(predicate::str::contains(
+            "screen-share  Open the guest in macOS Screen Sharing",
+        ))
+        .stdout(predicate::str::contains(
+            "console       Open Tart's local recovery console",
+        ))
+        .stdout(predicate::str::contains("\n  gui").not())
         .stdout(predicate::str::contains("internal-run").not())
         .stdout(predicate::str::contains("internal-keychain").not());
 }
@@ -277,4 +284,13 @@ fn suspended_vm_status_is_reported() {
         .assert()
         .success()
         .stdout(predicate::str::contains("state: suspended\n"));
+
+    cargo_bin_cmd!("gremvm")
+        .env("HOME", home.path())
+        .arg("screen-share")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "VM is not running; run 'gremvm start'",
+        ));
 }
