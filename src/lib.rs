@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use clap::{Args, Parser, ValueEnum};
+use nix::sys::termios::{LocalFlags, SetArg, Termios, tcgetattr, tcsetattr};
 use serde::{Deserialize, Serialize};
 use signal_hook::{
     consts::{SIGHUP, TERM_SIGNALS},
@@ -294,6 +295,31 @@ enum KeychainHelperMode {
 enum KeychainRequest {
     Check,
     Unlock { terminal: String },
+}
+
+struct HiddenInput {
+    terminal: fs::File,
+    original: Termios,
+}
+
+impl HiddenInput {
+    fn new(path: &str) -> Result<Self> {
+        let terminal = OpenOptions::new().read(true).write(true).open(path)?;
+        let original = tcgetattr(&terminal)?;
+        let input = Self { terminal, original };
+        let mut hidden = input.original.clone();
+        hidden
+            .local_flags
+            .remove(LocalFlags::ECHO | LocalFlags::ECHONL);
+        tcsetattr(&input.terminal, SetArg::TCSANOW, &hidden)?;
+        Ok(input)
+    }
+}
+
+impl Drop for HiddenInput {
+    fn drop(&mut self) {
+        let _ = tcsetattr(&self.terminal, SetArg::TCSANOW, &self.original);
+    }
 }
 
 struct App {
@@ -742,19 +768,10 @@ impl App {
 
     fn ensure_current_keychain(&self) -> Result<()> {
         if !keychain_unlocked(&self.paths)? {
-            interactive_terminal()?;
+            let terminal = interactive_terminal()?;
             ensure!(
-                Command::new("/usr/bin/security")
-                    .arg("unlock-keychain")
-                    .arg(login_keychain(&self.paths))
-                    .status()
-                    .context("cannot unlock the host login Keychain")?
-                    .success(),
+                unlock_keychain(&self.paths, &terminal)?,
                 "failed to unlock the host login Keychain"
-            );
-            ensure!(
-                keychain_unlocked(&self.paths)?,
-                "the host login Keychain remains locked"
             );
         }
         Ok(())
@@ -773,20 +790,32 @@ impl App {
     }
 
     fn run_keychain_helper(&self, request: KeychainRequest) -> Result<bool> {
+        let mut signals = Signals::new(TERM_SIGNALS.iter().copied().chain([SIGHUP]))?;
+        match request {
+            KeychainRequest::Check => {
+                self.run_keychain_helper_on("check", "/dev/null", 5, &mut signals)
+            }
+            KeychainRequest::Unlock { terminal } => {
+                ensure!(terminal.starts_with("/dev/tty"), "invalid terminal path");
+                let _input = HiddenInput::new(&terminal)?;
+                self.run_keychain_helper_on("unlock", &terminal, 300, &mut signals)
+            }
+        }
+    }
+
+    fn run_keychain_helper_on(
+        &self,
+        mode: &str,
+        terminal: &str,
+        timeout: u64,
+        signals: &mut Signals,
+    ) -> Result<bool> {
         private_dir(&self.paths.state)?;
         let plist_path = self.paths.state.join("keychain.plist");
         let result_path = self.paths.state.join("keychain.result");
         let domain = user_domain();
         self.cleanup_keychain_helper()?;
 
-        let (mode, terminal, timeout) = match request {
-            KeychainRequest::Check => ("check", "/dev/null".to_owned(), 5),
-            KeychainRequest::Unlock { terminal } => ("unlock", terminal, 300),
-        };
-        ensure!(
-            terminal == "/dev/null" || terminal.starts_with("/dev/tty"),
-            "invalid terminal path"
-        );
         let string = |path: &Path| {
             path.to_str()
                 .map(str::to_owned)
@@ -803,9 +832,9 @@ impl App {
             limit_load_to_session_type: "Background",
             process_type: "Background",
             run_at_load: true,
-            standard_in_path: terminal.clone(),
-            standard_out_path: terminal.clone(),
-            standard_error_path: terminal,
+            standard_in_path: terminal.to_owned(),
+            standard_out_path: terminal.to_owned(),
+            standard_error_path: terminal.to_owned(),
         };
         let mut temporary = NamedTempFile::new_in(&self.paths.state)?;
         plist::to_writer_xml(temporary.as_file_mut(), &plist)?;
@@ -817,7 +846,6 @@ impl App {
         let plist_path = string(&plist_path)?;
 
         let outcome = (|| {
-            let mut signals = Signals::new(TERM_SIGNALS.iter().copied().chain([SIGHUP]))?;
             self.launchctl(
                 &["bootstrap", &domain, &plist_path],
                 "load the Keychain helper",
@@ -1342,18 +1370,31 @@ fn keychain_unlocked(paths: &Paths) -> Result<bool> {
         .success())
 }
 
+fn unlock_keychain(paths: &Paths, terminal: &str) -> Result<bool> {
+    let mut signals = Signals::new(TERM_SIGNALS.iter().copied().chain([SIGHUP]))?;
+    let _input = HiddenInput::new(terminal)?;
+    let mut security = Command::new("/usr/bin/security")
+        .arg("unlock-keychain")
+        .arg(login_keychain(paths))
+        .spawn()
+        .context("cannot unlock the host login Keychain")?;
+    loop {
+        if signals.pending().next().is_some() {
+            let _ = security.kill();
+            let _ = security.wait();
+            return Ok(false);
+        }
+        if let Some(status) = security.try_wait()? {
+            return Ok(status.success() && keychain_unlocked(paths)?);
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn internal_keychain(paths: &Paths, mode: KeychainHelperMode) -> Result<()> {
     let unlocked = match mode {
         KeychainHelperMode::Check => keychain_unlocked(paths)?,
-        KeychainHelperMode::Unlock => {
-            Command::new("/usr/bin/security")
-                .arg("unlock-keychain")
-                .arg(login_keychain(paths))
-                .status()
-                .context("cannot unlock the host login Keychain")?
-                .success()
-                && keychain_unlocked(paths)?
-        }
+        KeychainHelperMode::Unlock => unlock_keychain(paths, &interactive_terminal()?)?,
     };
     private_dir(&paths.state)?;
     let mut result = NamedTempFile::new_in(&paths.state)?;

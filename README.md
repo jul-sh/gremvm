@@ -57,7 +57,7 @@ An SSH login alone does not start the VM. `start` explicitly loads the service i
 
 [Apple-silicon Macs on macOS 26 or later can unlock FileVault over SSH](https://support.apple.com/guide/deployment/intro-to-filevault-dep82064ec40/web) when Remote Login and a supported network connection are available. After the host finishes booting, run `gremvm start` as above.
 
-If the host login Keychain needs unlocking, `start` asks for the host account password in the invoking terminal. GremVM never stores that password or passes it on the command line, and the long-running service never prompts. Use `ssh -t` when invoking `start` as a one-shot SSH command.
+If the host login Keychain needs unlocking, `start` asks for the host account password in the invoking terminal with input hidden. GremVM never stores that password or passes it on the command line, and the long-running service never prompts. Use `ssh -t` when invoking `start` as a one-shot SSH command.
 
 ## Configuration
 

@@ -3,6 +3,7 @@ use predicates::prelude::*;
 use std::fs::OpenOptions;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
+use std::process::Command;
 
 #[test]
 fn help_describes_the_public_interface() {
@@ -108,6 +109,85 @@ fn keychain_helper_publishes_its_result() {
         .path()
         .join("Library/Application Support/GremVM/state/keychain.result");
     assert_eq!(std::fs::read_to_string(result).unwrap(), "locked\n");
+}
+
+#[test]
+fn keychain_prompt_hides_input_and_restores_the_terminal() {
+    let home = tempfile::tempdir().unwrap();
+    let password = "not-a-real-password";
+    let keychain = home.path().join("Library/Keychains/login.keychain-db");
+    std::fs::create_dir_all(keychain.parent().unwrap()).unwrap();
+    assert!(
+        Command::new("/usr/bin/security")
+            .args(["create-keychain", "-p", password])
+            .arg(&keychain)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new("/usr/bin/security")
+            .arg("lock-keychain")
+            .arg(&keychain)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let script = format!(
+        r#"set timeout 5
+spawn -noecho /bin/zsh -f -c {{
+    TRAPINT() {{ : }}
+    before=$(stty -g)
+    "$1" internal-keychain unlock || exit 95
+    /usr/bin/security show-keychain-info "$2" || exit 93
+    /usr/bin/security lock-keychain "$2" || exit 94
+    "$1" internal-keychain unlock || exit 96
+    [[ "$before" = "$(stty -g)" ]] || exit 92
+}} zsh {{{}}} {{{}}}
+expect {{
+    "password to unlock" {{}}
+    timeout {{ exit 90 }}
+    eof {{ exit 91 }}
+}}
+send -- "{password}\r"
+expect {{
+    "password to unlock" {{}}
+    timeout {{ exit 90 }}
+    eof {{ exit 91 }}
+}}
+send -- "\003"
+expect eof
+catch wait result
+exit [lindex $result 3]
+"#,
+        env!("CARGO_BIN_EXE_gremvm"),
+        keychain.display()
+    );
+    let output = Command::new("/usr/bin/expect")
+        .args(["-c", &script])
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+    let transcript = [output.stdout, output.stderr].concat();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&transcript)
+    );
+    assert!(
+        !String::from_utf8_lossy(&transcript).contains(password),
+        "{}",
+        String::from_utf8_lossy(&transcript)
+    );
+    assert_eq!(
+        std::fs::read_to_string(
+            home.path()
+                .join("Library/Application Support/GremVM/state/keychain.result")
+        )
+        .unwrap(),
+        "locked\n"
+    );
 }
 
 #[test]
