@@ -54,6 +54,30 @@
           > "$plugin_dir/${pluginExecutable}_SHA256SUM"
         '';
       };
+      tartVersion = "2.34.0";
+      tart = pkgs.stdenvNoCC.mkDerivation {
+        pname = "tart";
+        version = tartVersion;
+        src = pkgs.fetchurl {
+          url = "https://github.com/openai/tart/releases/download/${tartVersion}/tart.tar.gz";
+          hash = "sha256-yfFgn0lFJY7w7id91E3JcA1vBpeJoR5Dvn81sKZLMTU=";
+        };
+        sourceRoot = ".";
+        nativeBuildInputs = [ pkgs.makeWrapper ];
+        dontBuild = true;
+        dontFixup = true;
+        installPhase = ''
+          runHook preInstall
+          mkdir -p "$out/Applications" "$out/bin" "$out/share/tart"
+          cp -R tart.app "$out/Applications/tart.app"
+          makeWrapper "$out/Applications/tart.app/Contents/MacOS/tart" "$out/bin/tart"
+          install -m 0444 LICENSE "$out/share/tart/LICENSE"
+          runHook postInstall
+        '';
+        meta = pkgs.tart.meta // {
+          license = pkgs.lib.licenses.fsl11Asl20;
+        };
+      };
       gremvmBin = pkgs.rustPlatform.buildRustPackage {
         pname = "gremvm";
         version = "0.1.0";
@@ -63,12 +87,14 @@
       gremvm = pkgs.symlinkJoin {
         name = "gremvm";
         paths = [
-          pkgs.tart
           pkgs.packer
           packerPluginTart
         ];
         postBuild = ''
           install -m 0755 ${gremvmBin}/bin/gremvm "$out/bin/gremvm"
+          ln -s ${tart}/bin/tart "$out/bin/tart"
+          mkdir -p "$out/Applications"
+          ln -s ${tart}/Applications/tart.app "$out/Applications/tart.app"
           mkdir -p "$out/share/gremvm"
           install -m 0644 ${./packer/gremvm.pkr.hcl} "$out/share/gremvm/gremvm.pkr.hcl"
           install -m 0644 ${./packer/auto-login.pl} "$out/share/gremvm/auto-login.pl"
@@ -147,6 +173,8 @@
         bundle = pkgs.runCommand "gremvm-bundle-check" { } ''
           test -x ${gremvm}/bin/gremvm
           test -x ${gremvm}/bin/tart
+          test "$(${gremvm}/bin/tart --version)" = ${tartVersion}
+          /usr/bin/codesign --verify --deep --strict ${gremvm}/Applications/tart.app
           test -x ${gremvm}/bin/packer
           test -f ${gremvm}/share/gremvm/gremvm.pkr.hcl
           test -f ${gremvm}/share/gremvm/auto-login.pl
