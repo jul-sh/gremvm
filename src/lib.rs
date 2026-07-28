@@ -1156,6 +1156,7 @@ impl App {
         remove_if_present(&self.paths.run_marker)?;
         let source = match self.vm_info()?.state {
             VmState::Running => {
+                println!("saving VM state; this can take several minutes...");
                 success(
                     self.tart()?.args(["suspend", &self.config.vm_name]),
                     "suspend the VM",
@@ -1322,6 +1323,7 @@ impl App {
             match self.vm_info()?.state {
                 VmState::Running => {}
                 VmState::Suspended | VmState::Stopped => {
+                    println!("starting the background VM before opening the console...");
                     self.start_service()?;
                     self.wait_for_ssh(300)?;
                 }
@@ -1336,6 +1338,7 @@ impl App {
                 signals.pending().next().is_none(),
                 "console launch was interrupted"
             );
+            println!("opening Tart recovery console; this command stays active until it closes...");
             let mut run = Command::new("/usr/bin/caffeinate");
             self.configure_tart_storage(&mut run)?;
             run.process_group(0).args([
@@ -1379,6 +1382,7 @@ impl App {
             };
         }
         if resume_background {
+            println!("console closed; restoring the background VM...");
             touch(&self.paths.run_marker)?;
             self.start_service()?;
             println!("running: admin@{}", self.wait_for_ssh(300)?);

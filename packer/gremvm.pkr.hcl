@@ -39,6 +39,7 @@ source "tart-cli" "gremvm" {
   cpu_count          = var.cpu_count
   memory_gb          = var.memory_gb
   disk_size_gb       = var.disk_size_gb
+  display            = "1512x982px"
   recovery_partition = "relocate"
   headless           = true
   ssh_username       = "admin"

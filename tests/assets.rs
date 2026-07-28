@@ -16,6 +16,7 @@ fn packer_template_pins_the_image_and_preserves_recovery() {
     assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
     assert!(packer.contains("recovery_partition = \"relocate\""));
     assert!(packer.contains("headless           = true"));
+    assert!(packer.contains("display            = \"1512x982px\""));
     assert!(packer.contains("systemsetup -setremotelogin on"));
     assert!(packer.contains("PasswordAuthentication no"));
     assert!(packer.contains("/usr/bin/perl /tmp/gremvm-auto-login.pl"));
@@ -49,6 +50,10 @@ fn background_and_console_runs_are_suspendable() {
     assert_eq!(driver.matches("\"--suspendable\"").count(), 2);
     assert!(driver.contains(".args([\"suspend\", &self.config.vm_name])"));
     assert!(driver.contains("Command::new(\"/usr/bin/caffeinate\")"));
+    assert!(driver.contains("starting the background VM before opening the console"));
+    assert!(driver.contains("saving VM state; this can take several minutes"));
+    assert!(driver.contains("this command stays active until it closes"));
+    assert!(driver.contains("console closed; restoring the background VM"));
     assert!(driver.contains("background restart was withheld to avoid a cold boot"));
 }
 

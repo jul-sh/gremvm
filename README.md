@@ -16,6 +16,7 @@ GremVM approximates this with [Tart](https://tart.run/): a persistent macOS Taho
 - In background mode, the VM continues running after SSH disconnects and restarts after guest shutdowns or Tart failures.
 - Normal Screen Sharing does not change the VM lifecycle.
 - Opening Tart's recovery console preserves the live guest session.
+- The guest keeps a 1512x982-pixel virtual display in background mode.
 - The guest appears as a normal machine on the LAN, reachable through SSH and Screen Sharing.
 - A graphical login on the host is not required.
 
