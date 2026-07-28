@@ -1,56 +1,109 @@
 use assert_cmd::cargo::cargo_bin_cmd;
 use predicates::prelude::*;
-use std::fs::OpenOptions;
-use std::os::fd::AsRawFd;
+use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::process::Command;
+use std::path::{Path, PathBuf};
 
-#[test]
-fn help_describes_the_public_interface() {
-    cargo_bin_cmd!("gremvm")
-        .arg("install")
-        .arg("--help")
-        .assert()
-        .success()
-        .stdout(predicate::str::contains(
-            "--vm-name <VM_NAME>          Name of the Tart VM [default: gremvm]",
-        ))
-        .stdout(predicate::str::contains(
-            "--cpu-count <CPU_COUNT>      Number of virtual CPUs [default: 6]",
-        ))
-        .stdout(predicate::str::contains(
-            "--memory-gb <MEMORY_GB>      Guest memory in GiB [default: 24]",
-        ))
-        .stdout(predicate::str::contains(
-            "--disk-gb <DISK_GB>          Virtual disk size in decimal GB [default: 192]",
-        ))
-        .stdout(predicate::str::contains(
-            "--volume-name <VOLUME_NAME>  Encrypted APFS volume containing the VM",
-        ))
-        .stdout(
-            predicate::str::contains("Encrypted APFS volume containing the VM [default:").not(),
-        );
+fn app_root(home: &Path) -> PathBuf {
+    home.join("Library/Application Support/GremVM")
+}
 
-    cargo_bin_cmd!("gremvm")
-        .arg("--help")
-        .assert()
-        .success()
-        .stdout(predicate::str::contains(
-            "The guest always uses bridged networking on en0.",
-        ))
-        .stdout(predicate::str::contains(
-            "screen-share  Open the guest in macOS Screen Sharing",
-        ))
-        .stdout(predicate::str::contains(
-            "console       Open Tart's local recovery console",
-        ))
-        .stdout(predicate::str::contains("\n  gui").not())
-        .stdout(predicate::str::contains("internal-run").not())
-        .stdout(predicate::str::contains("internal-keychain").not());
+fn write_config(home: &Path, json: &str) {
+    let config = app_root(home).join("config/config.json");
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    fs::write(config, json).unwrap();
+}
+
+fn write_runtime(home: &Path, script: &str) {
+    let lume = app_root(home).join("runtime/bin/lume");
+    fs::create_dir_all(lume.parent().unwrap()).unwrap();
+    fs::write(&lume, script).unwrap();
+    fs::set_permissions(lume, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+fn mark_ready(home: &Path) {
+    let marker = app_root(home).join("state/provisioned");
+    fs::create_dir_all(marker.parent().unwrap()).unwrap();
+    fs::write(marker, "").unwrap();
+
+    let vm = home.join(".lume/gremvm");
+    fs::create_dir_all(&vm).unwrap();
+    for (name, contents) in [("config.json", "{}"), ("disk.img", ""), ("nvram.bin", "")] {
+        fs::write(vm.join(name), contents).unwrap();
+    }
+    fs::write(vm.join(".provisioning"), "stale").unwrap();
 }
 
 #[test]
-fn install_rejects_invalid_settings() {
+fn help_is_the_complete_public_interface() {
+    let output = cargo_bin_cmd!("gremvm")
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("persistent Lume macOS VM"))
+        .stdout(predicate::str::contains(
+            "The guest always uses bridged networking on en0.",
+        ))
+        .get_output()
+        .stdout
+        .clone();
+    let help = String::from_utf8(output).unwrap();
+
+    for command in [
+        "install",
+        "provision",
+        "status",
+        "start",
+        "stop",
+        "restart",
+        "ssh",
+        "screen-share",
+        "console",
+        "logs",
+        "uninstall",
+    ] {
+        assert!(
+            help.contains(command),
+            "missing command {command} in:\n{help}"
+        );
+    }
+    assert!(!help.contains("internal-run"));
+    assert!(!help.contains("internal-keychain"));
+
+    cargo_bin_cmd!("gremvm")
+        .args(["screen-share", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--url"))
+        .stdout(predicate::str::contains(
+            "Print the connection URL for use on another Mac",
+        ));
+    cargo_bin_cmd!("gremvm")
+        .args(["start", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("wait for its desktop"));
+}
+
+#[test]
+fn install_defaults_are_visible_and_the_volume_is_optional() {
+    cargo_bin_cmd!("gremvm")
+        .args(["install", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Name of the Lume VM"))
+        .stdout(predicate::str::contains("[default: gremvm]"))
+        .stdout(predicate::str::contains("[default: 6]"))
+        .stdout(predicate::str::contains("[default: 24]"))
+        .stdout(predicate::str::contains("[default: 192]"))
+        .stdout(predicate::str::contains("--volume-name <VOLUME_NAME>"))
+        .stdout(
+            predicate::str::contains("Encrypted APFS volume containing the VM [default:").not(),
+        );
+}
+
+#[test]
+fn install_rejects_unsafe_names_and_oversized_disks() {
     cargo_bin_cmd!("gremvm")
         .args(["install", "--vm-name", "../escape"])
         .assert()
@@ -69,7 +122,7 @@ fn install_rejects_invalid_settings() {
 }
 
 #[test]
-fn an_empty_home_reports_not_installed() {
+fn an_empty_home_is_not_installed() {
     let home = tempfile::tempdir().unwrap();
     cargo_bin_cmd!("gremvm")
         .env("HOME", home.path())
@@ -80,217 +133,96 @@ fn an_empty_home_reports_not_installed() {
 }
 
 #[test]
-fn management_commands_are_serialized() {
+fn persisted_configuration_is_strict() {
     let home = tempfile::tempdir().unwrap();
-    let state = home.path().join("Library/Application Support/GremVM/state");
-    std::fs::create_dir_all(&state).unwrap();
-    let lock = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(state.join("management.lock"))
-        .unwrap();
-    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
-
+    write_config(home.path(), "not json\n");
     cargo_bin_cmd!("gremvm")
         .env("HOME", home.path())
-        .arg("install")
+        .arg("start")
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "another gremvm management command is running",
+            "persisted configuration is invalid",
+        ));
+
+    write_config(
+        home.path(),
+        r#"{"vm_name":"gremvm","cpu_count":6,"memory_gb":24,"disk_gb":192,"storage":{"kind":"default"},"surprise":true}"#,
+    );
+    cargo_bin_cmd!("gremvm")
+        .env("HOME", home.path())
+        .arg("start")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "persisted configuration is invalid",
         ));
 }
 
 #[test]
-fn keychain_helper_publishes_its_result() {
+fn status_accepts_complete_vm_and_uses_isolated_lume_configuration() {
     let home = tempfile::tempdir().unwrap();
-    cargo_bin_cmd!("gremvm")
-        .env("HOME", home.path())
-        .args(["internal-keychain", "check"])
-        .assert()
-        .success();
-
-    let result = home
-        .path()
-        .join("Library/Application Support/GremVM/state/keychain.result");
-    assert_eq!(std::fs::read_to_string(result).unwrap(), "locked\n");
-}
-
-#[test]
-fn keychain_prompt_hides_input_and_restores_the_terminal() {
-    let home = tempfile::tempdir().unwrap();
-    let password = "not-a-real-password";
-    let keychain = home.path().join("Library/Keychains/login.keychain-db");
-    std::fs::create_dir_all(keychain.parent().unwrap()).unwrap();
-    assert!(
-        Command::new("/usr/bin/security")
-            .args(["create-keychain", "-p", password])
-            .arg(&keychain)
-            .status()
-            .unwrap()
-            .success()
+    write_config(
+        home.path(),
+        r#"{"vm_name":"gremvm","cpu_count":6,"memory_gb":24,"disk_gb":192,"storage":{"kind":"default"}}"#,
     );
-    assert!(
-        Command::new("/usr/bin/security")
-            .arg("lock-keychain")
-            .arg(&keychain)
-            .status()
-            .unwrap()
-            .success()
-    );
-    let script = format!(
-        r#"set timeout 5
-spawn -noecho /bin/zsh -f -c {{
-    TRAPINT() {{ : }}
-    before=$(stty -g)
-    "$1" internal-keychain unlock || exit 95
-    /usr/bin/security show-keychain-info "$2" || exit 93
-    /usr/bin/security lock-keychain "$2" || exit 94
-    "$1" internal-keychain unlock || exit 96
-    [[ "$before" = "$(stty -g)" ]] || exit 92
-}} zsh {{{}}} {{{}}}
-expect {{
-    "password to unlock" {{}}
-    timeout {{ exit 90 }}
-    eof {{ exit 91 }}
-}}
-send -- "{password}\r"
-expect {{
-    "password to unlock" {{}}
-    timeout {{ exit 90 }}
-    eof {{ exit 91 }}
-}}
-send -- "\003"
-expect eof
-catch wait result
-exit [lindex $result 3]
+    mark_ready(home.path());
+    write_runtime(
+        home.path(),
+        r#"#!/bin/sh
+printf '%s\n' "$@" > "$HOME/lume-args"
+printf '%s\n' "$XDG_CONFIG_HOME" > "$HOME/lume-config-home"
+test "$LUME_TELEMETRY_ENABLED" = 0 || exit 65
+test "$LUME_UPDATE_CHECK" = 0 || exit 66
+test "$LUME_LOG_LEVEL" = error || exit 67
+case "$1" in
+  --version) printf '%s\n' '0.4.0' ;;
+  get) printf '%s\n' '[{"name":"gremvm","os":"macOS","cpuCount":6,"memorySize":25769803776,"diskSize":{"allocated":1048576,"total":206158430208},"display":"1512x982","status":"stopped","vncUrl":null,"ipAddress":null,"sshAvailable":false,"locationName":"gremvm","networkMode":"bridged:en0"}]' ;;
+  *) exit 64 ;;
+esac
 "#,
-        env!("CARGO_BIN_EXE_gremvm"),
-        keychain.display()
     );
-    let output = Command::new("/usr/bin/expect")
-        .args(["-c", &script])
-        .env("HOME", home.path())
-        .output()
-        .unwrap();
-    let transcript = [output.stdout, output.stderr].concat();
 
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&transcript)
-    );
-    assert!(
-        !String::from_utf8_lossy(&transcript).contains(password),
-        "{}",
-        String::from_utf8_lossy(&transcript)
-    );
+    cargo_bin_cmd!("gremvm")
+        .env("HOME", home.path())
+        .arg("status")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("state: stopped"))
+        .stdout(predicate::str::contains("cpu: 6"))
+        .stdout(predicate::str::contains("memory-gb: 24"))
+        .stdout(predicate::str::contains("disk-gb: 192"))
+        .stdout(predicate::str::contains("display: 1512x982"))
+        .stdout(predicate::str::contains("network: bridged:en0"))
+        .stdout(predicate::str::contains(
+            home.path().join(".lume").to_str().unwrap(),
+        ));
+
+    let args = fs::read_to_string(home.path().join("lume-args")).unwrap();
+    for expected in [
+        "get",
+        "gremvm",
+        "--format",
+        "json",
+        "--storage",
+        home.path().join(".lume").to_str().unwrap(),
+    ] {
+        assert!(
+            args.lines().any(|arg| arg == expected),
+            "missing {expected:?} in {args:?}"
+        );
+    }
+
+    let config_home = fs::read_to_string(home.path().join("lume-config-home")).unwrap();
     assert_eq!(
-        std::fs::read_to_string(
-            home.path()
-                .join("Library/Application Support/GremVM/state/keychain.result")
-        )
-        .unwrap(),
-        "locked\n"
+        config_home.trim(),
+        app_root(home.path())
+            .join("state/lume-config")
+            .to_str()
+            .unwrap()
     );
-}
-
-#[test]
-fn malformed_configuration_has_a_clear_error() {
-    let home = tempfile::tempdir().unwrap();
-    let config = home
-        .path()
-        .join("Library/Application Support/GremVM/config");
-    std::fs::create_dir_all(&config).unwrap();
-    std::fs::write(config.join("config.json"), "not json\n").unwrap();
-
-    cargo_bin_cmd!("gremvm")
-        .env("HOME", home.path())
-        .arg("start")
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains(
-            "persisted configuration is invalid",
-        ));
-
-    std::fs::write(
-        config.join("config.json"),
-        r#"{"vm_name":"gremvm","cpu_count":6,"memory_gb":24,"disk_gb":192}"#,
-    )
-    .unwrap();
-    cargo_bin_cmd!("gremvm")
-        .env("HOME", home.path())
-        .arg("start")
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains(
-            "persisted configuration is invalid",
-        ));
-}
-
-#[test]
-fn default_storage_uses_tarts_normal_home() {
-    let home = tempfile::tempdir().unwrap();
-    let root = home.path().join("Library/Application Support/GremVM");
-    let config = root.join("config");
-    let tart = root.join("runtime/bin/tart");
-    std::fs::create_dir_all(&config).unwrap();
-    std::fs::create_dir_all(tart.parent().unwrap()).unwrap();
-    std::fs::write(
-        config.join("config.json"),
-        r#"{"vm_name":"gremvm","cpu_count":6,"memory_gb":24,"disk_gb":192,"storage":{"kind":"default"}}"#,
-    )
-    .unwrap();
-    std::fs::write(&tart, "#!/bin/sh\n[ \"${TART_HOME+x}\" != x ]\n").unwrap();
-    std::fs::set_permissions(&tart, std::fs::Permissions::from_mode(0o700)).unwrap();
-
-    cargo_bin_cmd!("gremvm")
-        .env("HOME", home.path())
-        .env("TART_HOME", "/unexpected")
-        .arg("status")
-        .assert()
-        .success()
-        .stdout("state: not-provisioned\n");
-}
-
-#[test]
-fn suspended_vm_status_is_reported() {
-    let home = tempfile::tempdir().unwrap();
-    let root = home.path().join("Library/Application Support/GremVM");
-    let config = root.join("config");
-    let state = root.join("state");
-    let tart = root.join("runtime/bin/tart");
-    std::fs::create_dir_all(&config).unwrap();
-    std::fs::create_dir_all(&state).unwrap();
-    std::fs::create_dir_all(tart.parent().unwrap()).unwrap();
-    std::fs::write(
-        config.join("config.json"),
-        r#"{"vm_name":"gremvm","cpu_count":6,"memory_gb":24,"disk_gb":192,"storage":{"kind":"default"}}"#,
-    )
-    .unwrap();
-    std::fs::write(state.join("provisioned"), "").unwrap();
-    std::fs::write(
-        &tart,
-        "#!/bin/sh\ncase \"$1\" in\nlist) echo gremvm;;\nget) echo '{\"State\":\"suspended\",\"CPU\":6,\"Memory\":24576,\"Disk\":192,\"OS\":\"darwin\"}';;\n*) exit 1;;\nesac\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&tart, std::fs::Permissions::from_mode(0o700)).unwrap();
-
-    cargo_bin_cmd!("gremvm")
-        .env("HOME", home.path())
-        .arg("status")
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("state: suspended\n"));
-
-    cargo_bin_cmd!("gremvm")
-        .env("HOME", home.path())
-        .arg("screen-share")
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains(
-            "VM is not running; run 'gremvm start'",
-        ));
+    let lume_config =
+        fs::read_to_string(app_root(home.path()).join("state/lume-config/lume/config.yaml"))
+            .unwrap();
+    assert!(lume_config.contains(home.path().join(".lume").to_str().unwrap()));
 }
