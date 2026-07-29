@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use clap::{Args, Parser, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use nix::sys::termios::{LocalFlags, SetArg, Termios, tcgetattr, tcsetattr};
 use serde::{Deserialize, Serialize};
 use signal_hook::{
@@ -54,6 +54,11 @@ enum Action {
     ScreenShare,
     /// Open Tart's local recovery console.
     Console,
+    /// Manage CLI-only Tailscale inside the guest.
+    Tailscale {
+        #[command(subcommand)]
+        action: TailscaleAction,
+    },
     /// Show VM logs.
     Logs {
         #[arg(long)]
@@ -68,6 +73,14 @@ enum Action {
         #[arg(value_enum)]
         mode: KeychainHelperMode,
     },
+}
+
+#[derive(Subcommand)]
+enum TailscaleAction {
+    /// Install, upgrade, and connect Tailscale.
+    Setup,
+    /// Show the guest's Tailscale connection.
+    Status,
 }
 
 #[derive(Args)]
@@ -181,6 +194,7 @@ struct Paths {
     launch_agent: PathBuf,
     command_link: PathBuf,
     ssh_key: PathBuf,
+    guest_tailscale: PathBuf,
 }
 
 impl Paths {
@@ -201,6 +215,7 @@ impl Paths {
             run_marker: state.join("run"),
             provisioned: state.join("provisioned"),
             ssh_key: config_dir.join("id_ed25519"),
+            guest_tailscale: root.join("runtime/libexec/gremvm/tailscaled"),
             logs: root.join("logs"),
             home,
             root,
@@ -235,6 +250,12 @@ enum VmState {
     Running,
     Suspended,
     Stopped,
+}
+
+enum TailscaleState {
+    NotInstalled,
+    Disconnected,
+    Connected { ip: String },
 }
 
 enum ConsoleSource {
@@ -372,6 +393,9 @@ pub fn run() -> Result<()> {
         | Action::Stop
         | Action::Restart
         | Action::Console
+        | Action::Tailscale {
+            action: TailscaleAction::Setup,
+        }
         | Action::Uninstall => Some(management_lock(&paths)?),
         _ => None,
     };
@@ -412,6 +436,7 @@ impl App {
             Action::Ssh { command } => self.ssh(&command),
             Action::ScreenShare => self.screen_share(),
             Action::Console => self.console(),
+            Action::Tailscale { action } => self.tailscale(action),
             Action::Logs { follow } => self.logs(follow),
             Action::Uninstall => self.uninstall(),
             Action::InternalRun => self.internal_run(),
@@ -490,6 +515,7 @@ impl App {
             "bin/packer",
             "share/gremvm/gremvm.pkr.hcl",
             "share/gremvm/auto-login.pl",
+            "libexec/gremvm/tailscaled",
         ] {
             ensure!(
                 bundle.join(file).is_file(),
@@ -1284,6 +1310,178 @@ impl App {
         let mut command = self.ssh_command(&ip);
         command.args(arguments);
         Err(anyhow!("cannot execute ssh: {}", command.exec()))
+    }
+
+    fn tailscale(&self, action: TailscaleAction) -> Result<()> {
+        self.ensure_storage()?;
+        ensure!(
+            self.vm_exists()?,
+            "VM does not exist; run 'gremvm provision'"
+        );
+        ensure!(
+            self.paths.provisioned.exists(),
+            "VM provisioning is incomplete"
+        );
+        match self.vm_info()?.state {
+            VmState::Running => {}
+            VmState::Suspended | VmState::Stopped => {
+                bail!("VM is not running; run 'gremvm start'")
+            }
+        }
+        let ip = self.wait_for_ssh(120)?;
+        match action {
+            TailscaleAction::Setup => self.setup_tailscale(&ip)?,
+            TailscaleAction::Status => {}
+        }
+        self.print_tailscale_status(&ip)
+    }
+
+    fn setup_tailscale(&self, ip: &str) -> Result<()> {
+        ensure!(
+            self.paths.guest_tailscale.is_file(),
+            "the packaged Tailscale binary is missing"
+        );
+        let output = self
+            .ssh_command(ip)
+            .arg(concat!(
+                "umask 077; ",
+                "/bin/cat > /Users/admin/.gremvm-tailscaled && ",
+                "/bin/chmod 0700 /Users/admin/.gremvm-tailscaled"
+            ))
+            .stdin(Stdio::from(fs::File::open(&self.paths.guest_tailscale)?))
+            .output()
+            .context("cannot upload Tailscale to the guest")?;
+        check_output(&output, "upload Tailscale to the guest")?;
+
+        let checksum = checked(
+            Command::new("/usr/bin/shasum")
+                .args(["-a", "256"])
+                .arg(&self.paths.guest_tailscale),
+            "hash the packaged Tailscale binary",
+        )?
+        .split_whitespace()
+        .next()
+        .context("shasum returned no digest")?
+        .to_owned();
+        ensure!(
+            checksum.len() == 64 && checksum.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "shasum returned an invalid digest"
+        );
+        let password = self.guest_password(CredentialPolicy::Existing)?;
+        let mut install = self
+            .ssh_command(ip)
+            .arg(format!(
+                concat!(
+                    "/usr/bin/sudo -S -k -p '' /bin/sh -c '",
+                    "stage=$(/usr/bin/mktemp /private/var/tmp/gremvm-tailscaled.XXXXXX) ",
+                    "|| exit 1; ",
+                    "/bin/cat /Users/admin/.gremvm-tailscaled > \"$stage\" && ",
+                    "/bin/chmod 0700 \"$stage\" && ",
+                    "test \"$(/usr/bin/shasum -a 256 \"$stage\" | ",
+                    "/usr/bin/cut -d \" \" -f 1)\" = {} && ",
+                    "\"$stage\" install-system-daemon && ",
+                    "/bin/ln -sfn tailscaled /usr/local/bin/tailscale && ",
+                    "/bin/launchctl unload ",
+                    "/Library/LaunchDaemons/com.tailscale.tailscaled.plist && ",
+                    "/usr/bin/plutil -insert KeepAlive -bool true ",
+                    "/Library/LaunchDaemons/com.tailscale.tailscaled.plist && ",
+                    "/bin/launchctl load ",
+                    "/Library/LaunchDaemons/com.tailscale.tailscaled.plist; ",
+                    "result=$?; /bin/rm -f \"$stage\"; exit $result",
+                    "'; result=$?; /bin/rm -f /Users/admin/.gremvm-tailscaled; exit $result"
+                ),
+                checksum
+            ))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("cannot install Tailscale in the guest")?;
+        writeln!(
+            install
+                .stdin
+                .take()
+                .context("guest sudo stdin is unavailable")?,
+            "{password}"
+        )?;
+        check_output(
+            &install.wait_with_output()?,
+            "install Tailscale in the guest",
+        )?;
+
+        success(
+            self.ssh_command(ip).arg(concat!(
+                "attempt=0; while [ \"$attempt\" -lt 10 ]; do ",
+                "/usr/local/bin/tailscale status --json --peers=false ",
+                ">/dev/null 2>&1 && exit 0; ",
+                "attempt=$((attempt + 1)); /bin/sleep 1; done; exit 1"
+            )),
+            "wait for Tailscale in the guest",
+        )?;
+        println!("authenticate using the URL below if Tailscale asks...");
+        let status = self
+            .ssh_command(ip)
+            .arg(format!(
+                "/usr/local/bin/tailscale up --accept-dns=false --hostname={} --operator=admin",
+                self.config.vm_name
+            ))
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .context("cannot connect Tailscale in the guest")?;
+        ensure!(status.success(), "failed to connect Tailscale in the guest");
+        Ok(())
+    }
+
+    fn print_tailscale_status(&self, ip: &str) -> Result<()> {
+        match self.tailscale_state(ip)? {
+            TailscaleState::NotInstalled => {
+                println!("tailscale: not-installed");
+                println!("next: gremvm tailscale setup");
+            }
+            TailscaleState::Disconnected => {
+                println!("tailscale: disconnected");
+                println!("next: gremvm tailscale setup");
+            }
+            TailscaleState::Connected { ip } => {
+                println!("tailscale: connected");
+                println!("tailscale-ip: {ip}");
+                println!("ssh: ssh admin@{ip}");
+                println!("screen-sharing: vnc://{ip}");
+            }
+        }
+        Ok(())
+    }
+
+    fn tailscale_state(&self, ip: &str) -> Result<TailscaleState> {
+        let state = checked(
+            self.ssh_command(ip).arg(concat!(
+                "if [ ! -x /usr/local/bin/tailscale ]; then ",
+                "printf 'not-installed\\n'; ",
+                "elif /usr/local/bin/tailscale wait --timeout=1s >/dev/null 2>&1 && ",
+                "address=$(/usr/local/bin/tailscale ip -4 2>/dev/null); then ",
+                "printf 'connected\\n%s\\n' \"$address\"; ",
+                "else printf 'disconnected\\n'; fi"
+            )),
+            "inspect Tailscale in the guest",
+        )?;
+        let mut lines = state.lines();
+        let parsed = match lines.next() {
+            Some("not-installed") => TailscaleState::NotInstalled,
+            Some("disconnected") => TailscaleState::Disconnected,
+            Some("connected") => {
+                let ip = lines
+                    .next()
+                    .context("Tailscale did not return an IPv4 address")?;
+                ip.parse::<std::net::Ipv4Addr>()
+                    .context("Tailscale returned an invalid IPv4 address")?;
+                TailscaleState::Connected { ip: ip.to_owned() }
+            }
+            _ => bail!("Tailscale returned an unknown state"),
+        };
+        ensure!(lines.next().is_none(), "Tailscale returned malformed state");
+        Ok(parsed)
     }
 
     fn screen_share(&self) -> Result<()> {

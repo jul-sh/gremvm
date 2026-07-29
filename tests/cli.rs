@@ -44,9 +44,24 @@ fn help_describes_the_public_interface() {
         .stdout(predicate::str::contains(
             "console       Open Tart's local recovery console",
         ))
+        .stdout(predicate::str::contains(
+            "tailscale     Manage CLI-only Tailscale inside the guest",
+        ))
         .stdout(predicate::str::contains("\n  gui").not())
         .stdout(predicate::str::contains("internal-run").not())
         .stdout(predicate::str::contains("internal-keychain").not());
+
+    cargo_bin_cmd!("gremvm")
+        .args(["tailscale", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "setup   Install, upgrade, and connect Tailscale",
+        ))
+        .stdout(predicate::str::contains(
+            "status  Show the guest's Tailscale connection",
+        ))
+        .stdout(predicate::str::contains("auth-key").not());
 }
 
 #[test]
@@ -288,6 +303,15 @@ fn suspended_vm_status_is_reported() {
     cargo_bin_cmd!("gremvm")
         .env("HOME", home.path())
         .arg("screen-share")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "VM is not running; run 'gremvm start'",
+        ));
+
+    cargo_bin_cmd!("gremvm")
+        .env("HOME", home.path())
+        .args(["tailscale", "status"])
         .assert()
         .failure()
         .stderr(predicate::str::contains(

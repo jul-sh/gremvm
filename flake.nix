@@ -98,10 +98,18 @@
           mkdir -p "$out/share/gremvm"
           install -m 0644 ${./packer/gremvm.pkr.hcl} "$out/share/gremvm/gremvm.pkr.hcl"
           install -m 0644 ${./packer/auto-login.pl} "$out/share/gremvm/auto-login.pl"
+          mkdir -p "$out/libexec/gremvm" "$out/share/gremvm/licenses"
+          install -m 0755 ${pkgs.tailscale}/bin/.tailscaled-wrapped \
+            "$out/libexec/gremvm/tailscaled"
+          install -m 0644 ${pkgs.tailscale.src}/LICENSE \
+            "$out/share/gremvm/licenses/tailscale.txt"
         '';
         meta = {
           description = "Manage one persistent Tart macOS VM";
-          license = pkgs.lib.licenses.mit;
+          license = [
+            pkgs.lib.licenses.mit
+            pkgs.lib.licenses.bsd3
+          ];
           mainProgram = "gremvm";
           platforms = [ system ];
         };
@@ -178,6 +186,10 @@
           test -x ${gremvm}/bin/packer
           test -f ${gremvm}/share/gremvm/gremvm.pkr.hcl
           test -f ${gremvm}/share/gremvm/auto-login.pl
+          test -x ${gremvm}/libexec/gremvm/tailscaled
+          test -f ${gremvm}/share/gremvm/licenses/tailscale.txt
+          test "$(${gremvm}/libexec/gremvm/tailscaled --version | head -n 1)" = ${pkgs.tailscale.version}
+          /usr/bin/codesign --verify --strict ${gremvm}/libexec/gremvm/tailscaled
           test -f ${gremvm}/libexec/packer/plugins/github.com/cirruslabs/tart/${pluginExecutable}
           HOME="$TMPDIR/home" ${gremvm}/bin/gremvm --help >/dev/null
           mkdir -p "$TMPDIR/home" "$TMPDIR/packer"

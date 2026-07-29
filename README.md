@@ -42,7 +42,7 @@ nix run .#gremvm -- install
 gremvm provision
 ```
 
-`install` writes the configuration, creates credentials, registers the Nix bundle as a garbage-collection root, and installs the per-user service definition. `provision` downloads the pinned image, creates the VM, starts it, and waits for SSH. Provisioning can take several minutes and requires an uninterrupted network connection.
+These commands use the defaults below. To change them, pass the desired flags to the first `install`; that choice is saved for this VM. `install` writes the configuration, creates credentials, registers the Nix bundle as a garbage-collection root, and installs the per-user service definition. `provision` downloads the pinned image, creates the VM, starts it, and waits for SSH. Provisioning can take several minutes and requires an uninterrupted network connection.
 
 On macOS 15 and later, Packer may trigger a one-time Local Network privacy prompt. For provisioning without a graphical session, apply [Tart's documented noninteractive workaround](https://tart.run/faq/#avoiding-the-local-network-permission-pop-up) before running `provision`.
 
@@ -95,6 +95,8 @@ gremvm ssh
 gremvm ssh sw_vers
 gremvm screen-share
 gremvm console
+gremvm tailscale setup
+gremvm tailscale status
 gremvm stop
 gremvm start
 gremvm restart
@@ -137,6 +139,43 @@ An already running guest does not reboot during a successful handoff; a stopped 
 Security note: provisioning disables the macOS application firewall in the guest. Any enabled service bound to a non-loopback interface is directly reachable from the LAN, subject only to network-level filtering or client isolation. Automatic login requires guest FileVault to remain off and stores a reversible login secret in the guest's `/etc/kcpassword` file.
 
 The `ssh` command uses the dedicated private key stored on the host. To connect over SSH from another computer, add that computer's public key to `/Users/admin/.ssh/authorized_keys` in the guest.
+
+## Tailscale
+
+Tailscale access is optional and runs directly inside the guest. GremVM uses Tailscale's open-source, CLI-only macOS daemon: there is no guest application, menu-bar item, system-extension approval, or dependency on a graphical login. The existing bridged LAN connection remains unchanged.
+
+With the VM running, install or upgrade the pinned guest daemon and join a tailnet:
+
+```sh
+gremvm tailscale setup
+```
+
+If the guest is not already authorized, the command prints a Tailscale authentication URL and waits. Open it on any computer and approve the guest. Pressing Control-C is safe; rerun the command to continue. GremVM derives the tailnet hostname from the configured VM name and stores no Tailscale credential. Tailscale keeps its node identity inside the guest, and its system daemon starts before login and restarts if it exits.
+
+Show the stable remote address and connection commands with:
+
+```sh
+gremvm tailscale status
+```
+
+On another Mac, install the same [CLI-only variant](https://github.com/tailscale/tailscale/wiki/Tailscaled-on-macOS) if it is not already connected:
+
+```sh
+brew install --formula tailscale
+sudo brew services start tailscale
+sudo tailscale up
+```
+
+Then connect to the guest from that Mac:
+
+```sh
+ssh admin@100.x.y.z
+open 'vnc://100.x.y.z'
+```
+
+Use the reported address in place of `100.x.y.z`. The other Mac's public SSH key must be present in the guest as described above, and Screen Sharing still authenticates with the guest `admin` password. A restrictive tailnet policy must permit TCP ports 22 and 5900 to the guest. That policy governs the Tailscale path only; the guest remains directly exposed to its bridged LAN. MagicDNS can provide a name, but GremVM always reports the numeric address because the CLI-only macOS variant does not configure macOS DNS itself.
+
+CLI-only Tailscale does not update itself. GremVM ships a version pinned by `flake.lock`; after updating GremVM, rerun `gremvm tailscale setup` to upgrade the guest without changing its node identity. For durable unattended access, disable key expiry for this device or assign it a [tag in the Tailscale admin console](https://tailscale.com/docs/features/tags). To disconnect or forget the guest, run `gremvm ssh /usr/local/bin/tailscale down` or `gremvm ssh /usr/local/bin/tailscale logout`; `setup` reconnects it. `gremvm uninstall` preserves the VM and therefore preserves its Tailscale installation and identity.
 
 ## Storage
 

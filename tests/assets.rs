@@ -64,3 +64,14 @@ fn screen_sharing_uses_the_guest_ip() {
     assert!(driver.contains("Command::new(\"/usr/bin/open\").arg(format!(\"vnc://{ip}\"))"));
     assert!(driver.contains("Action::ScreenShare => self.screen_share()"));
 }
+
+#[test]
+fn tailscale_upload_is_verified_before_root_executes_it() {
+    let driver = include_str!("../src/lib.rs");
+
+    assert!(driver.contains("umask 077; "));
+    assert!(driver.contains("/bin/chmod 0700 /Users/admin/.gremvm-tailscaled"));
+    assert!(driver.contains("/private/var/tmp/gremvm-tailscaled.XXXXXX"));
+    assert!(driver.contains("/usr/bin/shasum -a 256 \\\"$stage\\\""));
+    assert!(!driver.contains(".gremvm-tailscaled install-system-daemon"));
+}
