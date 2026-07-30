@@ -1,19 +1,36 @@
 use assert_cmd::cargo::cargo_bin_cmd;
+use assert_cmd::prelude::*;
 use predicates::prelude::*;
 use std::fs::OpenOptions;
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{PermissionsExt, symlink};
+use std::path::{Path, PathBuf};
 use std::process::Command;
+
+fn command_alias(directory: &Path, name: &str) -> PathBuf {
+    let alias = directory.join(name);
+    symlink(env!("CARGO_BIN_EXE_gremvm"), &alias).unwrap();
+    alias
+}
 
 #[test]
 fn help_describes_the_public_interface() {
-    cargo_bin_cmd!("gremvm")
+    cargo_bin_cmd!("gremvm-install")
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Usage: nix run . -- <COMMAND>"))
+        .stdout(predicate::str::contains("\n  install"))
+        .stdout(predicate::str::contains("\n  start").not())
+        .stdout(predicate::str::contains("\n  status").not());
+
+    cargo_bin_cmd!("gremvm-install")
         .arg("install")
         .arg("--help")
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "--vm-name <VM_NAME>        Name of the Tart VM [default: gremvm]",
+            "<NAME>  VM and command name to install",
         ))
         .stdout(predicate::str::contains(
             "--cpu-count <CPU_COUNT>    Number of virtual CPUs [default: 6]",
@@ -33,15 +50,13 @@ fn help_describes_the_public_interface() {
         .stdout(predicate::str::contains(
             "--storage <DIRECTORY>      Existing absolute directory containing the VM",
         ))
+        .stdout(predicate::str::contains("--vm-name").not())
         .stdout(predicate::str::contains("--volume-name").not());
 
     cargo_bin_cmd!("gremvm")
         .arg("--help")
         .assert()
         .success()
-        .stdout(predicate::str::contains(
-            "install       Install or update GremVM and create the VM if needed",
-        ))
         .stdout(predicate::str::contains(
             "The guest always uses bridged networking on en0.",
         ))
@@ -54,10 +69,27 @@ fn help_describes_the_public_interface() {
         .stdout(predicate::str::contains(
             "tailscale     Manage CLI-only Tailscale inside the guest",
         ))
+        .stdout(predicate::str::contains("\n  install").not())
         .stdout(predicate::str::contains("\n  provision").not())
         .stdout(predicate::str::contains("\n  gui").not())
         .stdout(predicate::str::contains("internal-run").not())
         .stdout(predicate::str::contains("internal-keychain").not());
+
+    cargo_bin_cmd!("gremvm")
+        .arg("install")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "unrecognized subcommand 'install'",
+        ));
+
+    let aliases = tempfile::tempdir().unwrap();
+    Command::new(command_alias(aliases.path(), "foovm"))
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Usage: foovm <COMMAND>"))
+        .stdout(predicate::str::contains("\n  install").not());
 
     cargo_bin_cmd!("gremvm")
         .arg("provision")
@@ -82,28 +114,38 @@ fn help_describes_the_public_interface() {
 
 #[test]
 fn install_rejects_invalid_settings() {
-    cargo_bin_cmd!("gremvm")
-        .args(["install", "--vm-name", "../escape"])
+    cargo_bin_cmd!("gremvm-install")
+        .arg("install")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("<NAME>"));
+    cargo_bin_cmd!("gremvm-install")
+        .args(["install", "../escape"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("name must be"));
-    cargo_bin_cmd!("gremvm")
-        .args(["install", "--disk-gb", "10001"])
+    cargo_bin_cmd!("gremvm-install")
+        .args(["install", "gremvm", "--vm-name", "foovm"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("10001 is not in 50..=10000"));
-    cargo_bin_cmd!("gremvm")
-        .args(["install", "--guest-user", "Admin"])
+        .stderr(predicate::str::contains("unexpected argument '--vm-name'"));
+    cargo_bin_cmd!("gremvm-install")
+        .args(["install", "gremvm", "--disk-gb", "49"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("49 is not in 50.."));
+    cargo_bin_cmd!("gremvm-install")
+        .args(["install", "gremvm", "--guest-user", "Admin"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("guest user must be"));
-    cargo_bin_cmd!("gremvm")
-        .args(["install", "--guest-user", "root"])
+    cargo_bin_cmd!("gremvm-install")
+        .args(["install", "gremvm", "--guest-user", "root"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("reserved account"));
-    cargo_bin_cmd!("gremvm")
-        .args(["install", "--storage", "relative/path"])
+    cargo_bin_cmd!("gremvm-install")
+        .args(["install", "gremvm", "--storage", "relative/path"])
         .assert()
         .failure()
         .stderr(predicate::str::contains(
@@ -112,8 +154,8 @@ fn install_rejects_invalid_settings() {
 
     let home = tempfile::tempdir().unwrap();
     let missing = home.path().join("missing");
-    cargo_bin_cmd!("gremvm")
-        .args(["install", "--storage"])
+    cargo_bin_cmd!("gremvm-install")
+        .args(["install", "gremvm", "--storage"])
         .arg(&missing)
         .assert()
         .failure()
@@ -121,7 +163,7 @@ fn install_rejects_invalid_settings() {
 }
 
 #[test]
-fn install_accepts_the_upper_disk_limit_and_explicit_storage() {
+fn install_accepts_large_disks_and_explicit_storage() {
     let home = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
     let state = home.path().join("Library/Application Support/GremVM/state");
@@ -135,12 +177,13 @@ fn install_accepts_the_upper_disk_limit_and_explicit_storage() {
         .unwrap();
     assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
 
-    cargo_bin_cmd!("gremvm")
+    cargo_bin_cmd!("gremvm-install")
         .env("HOME", home.path())
         .args([
             "install",
+            "gremvm",
             "--disk-gb",
-            "10000",
+            "5000000000",
             "--guest-user",
             "build_user",
             "--ask-password",
@@ -179,13 +222,50 @@ fn management_commands_are_serialized() {
         .unwrap();
     assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
 
-    cargo_bin_cmd!("gremvm")
+    cargo_bin_cmd!("gremvm-install")
+        .env("HOME", home.path())
+        .args(["install", "gremvm"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "another gremvm management command is running",
+        ));
+}
+
+#[test]
+fn named_install_uses_its_own_management_lock() {
+    let home = tempfile::tempdir().unwrap();
+    let aliases = tempfile::tempdir().unwrap();
+    let foovm = command_alias(aliases.path(), "foovm");
+    let state = home
+        .path()
+        .join("Library/Application Support/GremVM/instances/foovm/state");
+    std::fs::create_dir_all(&state).unwrap();
+    let lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(state.join("management.lock"))
+        .unwrap();
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+
+    cargo_bin_cmd!("gremvm-install")
+        .env("HOME", home.path())
+        .args(["install", "foovm"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "another foovm management command is running",
+        ));
+
+    Command::new(foovm)
         .env("HOME", home.path())
         .arg("install")
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "another gremvm management command is running",
+            "unrecognized subcommand 'install'",
         ));
 }
 
@@ -403,7 +483,7 @@ fn default_storage_uses_tarts_normal_home() {
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "VM does not exist; rerun 'gremvm install'",
+            "VM does not exist; rerun 'nix run github:jul-sh/gremvm -- install gremvm'",
         ));
 }
 
@@ -424,7 +504,7 @@ fn explicit_storage_uses_the_exact_directory() {
             "guest_user": "build_user",
             "cpu_count": 6,
             "memory_gb": 24,
-            "disk_gb": 10_000,
+            "disk_gb": 5_000_000_000_u64,
             "storage": {
                 "kind": "directory",
                 "path": &storage,
@@ -448,6 +528,243 @@ fn explicit_storage_uses_the_exact_directory() {
         .assert()
         .success()
         .stdout("state: incomplete\n");
+}
+
+#[test]
+fn command_names_select_isolated_vms() {
+    let home = tempfile::tempdir().unwrap();
+    let aliases = tempfile::tempdir().unwrap();
+    let foovm = command_alias(aliases.path(), "foovm");
+    let base = home.path().join("Library/Application Support/GremVM");
+
+    for (root, name, cpu, disk, run) in [
+        (base.clone(), "gremvm", 6, 192, false),
+        (base.join("instances/foovm"), "foovm", 4, 96, true),
+    ] {
+        let config = root.join("config");
+        let state = root.join("state");
+        let tart = root.join("runtime/bin/tart");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::create_dir_all(tart.parent().unwrap()).unwrap();
+        std::fs::write(
+            config.join("config.json"),
+            serde_json::json!({
+                "vm_name": name,
+                "cpu_count": cpu,
+                "memory_gb": 8,
+                "disk_gb": disk,
+                "storage": { "kind": "default" },
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(state.join("provisioned"), "").unwrap();
+        if run {
+            std::fs::write(state.join("run"), "").unwrap();
+        }
+        std::fs::write(
+            &tart,
+            format!(
+                "#!/bin/sh\ncase \"$1\" in\nlist) echo {name};;\nget) echo '{{\"State\":\"stopped\",\"CPU\":{cpu},\"Memory\":8192,\"Disk\":{disk},\"OS\":\"darwin\"}}';;\n*) exit 1;;\nesac\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&tart, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    cargo_bin_cmd!("gremvm")
+        .env("HOME", home.path())
+        .arg("status")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("state: stopped\n"))
+        .stdout(predicate::str::contains("name: gremvm\n"))
+        .stdout(predicate::str::contains("cpu: 6\n"))
+        .stdout(predicate::str::contains("disk-gb: 192\n"));
+
+    Command::new(&foovm)
+        .env("HOME", home.path())
+        .arg("status")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("state: stopped\n"))
+        .stdout(predicate::str::contains("name: foovm\n"))
+        .stdout(predicate::str::contains("cpu: 4\n"))
+        .stdout(predicate::str::contains("disk-gb: 96\n"));
+
+    Command::new(&foovm)
+        .env("HOME", home.path())
+        .arg("screen-share")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "VM is not running; run 'foovm start'",
+        ));
+
+    Command::new(&foovm)
+        .env("HOME", home.path())
+        .arg("internal-keychain")
+        .arg("check")
+        .assert()
+        .success();
+    assert!(base.join("instances/foovm/state/keychain.result").is_file());
+    assert!(!base.join("state/keychain.result").exists());
+}
+
+#[test]
+fn uninstall_deletes_only_the_selected_vm_data() {
+    let home = tempfile::tempdir().unwrap();
+    let aliases = tempfile::tempdir().unwrap();
+    let bundle = tempfile::tempdir().unwrap();
+    let name = format!("testvm{}", std::process::id());
+    let command = command_alias(aliases.path(), &name);
+    let root = home
+        .path()
+        .join("Library/Application Support/GremVM/instances")
+        .join(&name);
+    let config = root.join("config");
+    let state = root.join("state");
+    let logs = root.join("logs");
+    let runtime = root.join("runtime");
+    let bundle_bin = bundle.path().join("bin");
+    let command_link = home.path().join(".local/bin").join(&name);
+    let autoload_agent = home
+        .path()
+        .join("Library/LaunchAgents")
+        .join(format!("io.gremvm.tart.{name}.plist"));
+    let vm_state = home.path().join("fake-vm-exists");
+    let trace = home.path().join("tart.trace");
+    let unrelated = home.path().join(".tart/vms/unrelated/data");
+
+    for directory in [
+        &config,
+        &state,
+        &logs,
+        &bundle_bin,
+        command_link.parent().unwrap(),
+        autoload_agent.parent().unwrap(),
+        unrelated.parent().unwrap(),
+    ] {
+        std::fs::create_dir_all(directory).unwrap();
+    }
+    std::fs::write(
+        config.join("config.json"),
+        serde_json::json!({
+            "vm_name": name,
+            "guest_user": "admin",
+            "cpu_count": 6,
+            "memory_gb": 24,
+            "disk_gb": 192,
+            "storage": { "kind": "default" },
+        })
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(state.join("provisioned"), "").unwrap();
+    std::fs::write(state.join("service.plist"), "service").unwrap();
+    std::fs::write(&autoload_agent, "legacy service").unwrap();
+    std::fs::write(&vm_state, "exists").unwrap();
+    std::fs::write(&unrelated, "keep").unwrap();
+    std::fs::write(bundle_bin.join("gremvm"), "runtime").unwrap();
+    let tart = bundle_bin.join("tart");
+    std::fs::write(
+        &tart,
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "$FAKE_TART_TRACE"
+case "$1" in
+  list) [ ! -f "$FAKE_TART_STATE" ] || printf '%s\n' "$FAKE_VM_NAME" ;;
+  get) printf '{"State":"stopped","CPU":6,"Memory":24576,"Disk":192,"OS":"darwin"}\n' ;;
+  delete) [ "$2" = "$FAKE_VM_NAME" ] || exit 42; rm "$FAKE_TART_STATE" ;;
+  *) exit 43 ;;
+esac
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&tart, std::fs::Permissions::from_mode(0o700)).unwrap();
+    symlink(bundle.path(), &runtime).unwrap();
+    symlink(runtime.join("bin/gremvm"), &command_link).unwrap();
+
+    Command::new(command)
+        .env("HOME", home.path())
+        .env("FAKE_VM_NAME", &name)
+        .env("FAKE_TART_STATE", &vm_state)
+        .env("FAKE_TART_TRACE", &trace)
+        .arg("uninstall")
+        .assert()
+        .success()
+        .stdout(format!("uninstalled: {name}\n"));
+
+    assert!(!vm_state.exists());
+    assert!(!runtime.exists());
+    assert!(!command_link.exists());
+    assert!(!state.join("service.plist").exists());
+    assert!(!autoload_agent.exists());
+    assert!(config.join("config.json").is_file());
+    assert_eq!(std::fs::read_to_string(unrelated).unwrap(), "keep");
+    assert!(
+        std::fs::read_to_string(trace)
+            .unwrap()
+            .lines()
+            .any(|line| line == format!("delete {name}"))
+    );
+}
+
+#[test]
+fn a_command_cannot_select_another_vms_configuration() {
+    let home = tempfile::tempdir().unwrap();
+    let aliases = tempfile::tempdir().unwrap();
+    let foovm = command_alias(aliases.path(), "foovm");
+    let config = home
+        .path()
+        .join("Library/Application Support/GremVM/instances/foovm/config");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(
+        config.join("config.json"),
+        r#"{"vm_name":"barvm","cpu_count":6,"memory_gb":24,"disk_gb":192,"storage":{"kind":"default"}}"#,
+    )
+    .unwrap();
+
+    Command::new(foovm)
+        .env("HOME", home.path())
+        .arg("start")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "configuration belongs to command 'barvm', not 'foovm'",
+        ));
+}
+
+#[test]
+fn the_original_command_preserves_legacy_custom_vm_names() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("Library/Application Support/GremVM");
+    let config = root.join("config");
+    let state = root.join("state");
+    let tart = root.join("runtime/bin/tart");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::create_dir_all(tart.parent().unwrap()).unwrap();
+    std::fs::write(
+        config.join("config.json"),
+        r#"{"vm_name":"oldvm","cpu_count":6,"memory_gb":24,"disk_gb":192,"storage":{"kind":"default"}}"#,
+    )
+    .unwrap();
+    std::fs::write(state.join("provisioned"), "").unwrap();
+    std::fs::write(
+        &tart,
+        "#!/bin/sh\ncase \"$1\" in\nlist) echo oldvm;;\nget) echo '{\"State\":\"stopped\",\"CPU\":6,\"Memory\":24576,\"Disk\":192,\"OS\":\"darwin\"}';;\n*) exit 1;;\nesac\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&tart, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    cargo_bin_cmd!("gremvm")
+        .env("HOME", home.path())
+        .arg("status")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("state: stopped\n"))
+        .stdout(predicate::str::contains("name: oldvm\n"));
 }
 
 #[test]

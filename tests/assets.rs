@@ -49,6 +49,26 @@ fn background_and_console_runs_are_suspendable() {
 }
 
 #[test]
+fn install_requires_an_explicit_start() {
+    let driver = include_str!("../src/lib.rs");
+    let install = driver
+        .split_once("    fn install(&self")
+        .unwrap()
+        .1
+        .split_once("    fn install_plan(&self")
+        .unwrap()
+        .0;
+
+    assert!(install.contains("remove_if_present(&self.paths.run_marker)?"));
+    assert!(install.contains("self.stop_tart()?"));
+    assert!(install.contains("next: {} start"));
+    assert!(!install.contains("self.start_service()"));
+    assert!(!install.contains("self.wait_for_ssh"));
+    assert!(driver.contains("service_plist: state.join(\"service.plist\")"));
+    assert!(driver.contains("remove_if_present(&self.paths.autoload_agent())?"));
+}
+
+#[test]
 fn screen_sharing_uses_the_guest_ip() {
     let driver = include_str!("../src/lib.rs");
 

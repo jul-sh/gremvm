@@ -92,6 +92,7 @@
         ];
         postBuild = ''
           install -m 0755 ${gremvmBin}/bin/gremvm "$out/bin/gremvm"
+          install -m 0755 ${gremvmBin}/bin/gremvm-install "$out/bin/gremvm-install"
           ln -s ${tart}/bin/tart "$out/bin/tart"
           mkdir -p "$out/Applications"
           ln -s ${tart}/Applications/tart.app "$out/Applications/tart.app"
@@ -111,26 +112,20 @@
             pkgs.lib.licenses.mit
             pkgs.lib.licenses.bsd3
           ];
-          mainProgram = "gremvm";
+          mainProgram = "gremvm-install";
           platforms = [ system ];
         };
       };
       gremvmApp = {
         type = "app";
-        program = "${gremvm}/bin/gremvm";
+        program = "${gremvm}/bin/gremvm-install";
         meta.description = "Manage one persistent Tart macOS VM";
       };
     in
     {
-      packages.${system} = {
-        default = gremvm;
-        inherit gremvm;
-      };
+      packages.${system}.default = gremvm;
 
-      apps.${system} = {
-        default = gremvmApp;
-        gremvm = gremvmApp;
-      };
+      apps.${system}.default = gremvmApp;
 
       devShells.${system}.default = pkgs.mkShell {
         packages = [
@@ -181,6 +176,7 @@
         };
         bundle = pkgs.runCommand "gremvm-bundle-check" { } ''
           test -x ${gremvm}/bin/gremvm
+          test -x ${gremvm}/bin/gremvm-install
           test -x ${gremvm}/bin/tart
           test "$(${gremvm}/bin/tart --version)" = ${tartVersion}
           /usr/bin/codesign --verify --deep --strict ${gremvm}/Applications/tart.app
@@ -193,7 +189,9 @@
           test "$(${gremvm}/libexec/gremvm/tailscaled --version | head -n 1)" = ${pkgs.tailscale.version}
           /usr/bin/codesign --verify --strict ${gremvm}/libexec/gremvm/tailscaled
           test -f ${gremvm}/libexec/packer/plugins/github.com/cirruslabs/tart/${pluginExecutable}
+          HOME="$TMPDIR/home" ${gremvm}/bin/gremvm-install install --help >/dev/null
           HOME="$TMPDIR/home" ${gremvm}/bin/gremvm --help >/dev/null
+          ! HOME="$TMPDIR/home" ${gremvm}/bin/gremvm install >/dev/null 2>&1
           mkdir -p "$TMPDIR/home" "$TMPDIR/packer"
           cp ${gremvm}/share/gremvm/gremvm.pkr.hcl "$TMPDIR/packer/gremvm.pkr.hcl"
           cp ${gremvm}/share/gremvm/configure-guest.sh "$TMPDIR/packer/configure-guest.sh"

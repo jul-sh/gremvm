@@ -20,26 +20,34 @@ use std::time::{Duration, Instant};
 use tempfile::NamedTempFile;
 
 mod install_state;
+mod instance;
 
 use install_state::{VmInstallation, classify};
+use instance::{Identity, resolve};
 
-const LABEL: &str = "io.gremvm.tart";
-const KEYCHAIN_HELPER_LABEL: &str = "io.gremvm.keychain";
-const PASSWORD_SERVICE: &str = "io.gremvm.tart.gui-password";
 const VOLUME_PASSWORD_SERVICE: &str = "io.gremvm.volume-password";
 const BRIDGE: &str = "en0";
 
 #[derive(Parser)]
 #[command(
-    name = "gremvm",
+    bin_name = "nix run . --",
     version,
-    about = "Manage one persistent Tart macOS VM",
+    about = "Install a persistent Tart macOS VM",
+    arg_required_else_help = true
+)]
+enum InstallerAction {
+    /// Install or update GremVM and create the VM if needed.
+    Install(InstallOptions),
+}
+
+#[derive(Parser)]
+#[command(
+    version,
+    about = "Manage a persistent Tart macOS VM",
     arg_required_else_help = true,
     after_help = "The guest always uses bridged networking on en0."
 )]
 enum Action {
-    /// Install or update GremVM and create the VM if needed.
-    Install(InstallOptions),
     /// Show VM state.
     Status,
     /// Start the VM and wait for SSH.
@@ -67,7 +75,7 @@ enum Action {
         #[arg(long)]
         follow: bool,
     },
-    /// Remove the service and runtime, preserving VM data.
+    /// Delete the VM and remove its service and runtime.
     Uninstall,
     #[command(name = "internal-run", hide = true)]
     InternalRun,
@@ -88,9 +96,9 @@ enum TailscaleAction {
 
 #[derive(Args)]
 struct InstallOptions {
-    /// Name of the Tart VM.
-    #[arg(long, default_value = "gremvm", value_parser = valid_name)]
-    vm_name: String,
+    /// VM and command name to install.
+    #[arg(value_name = "NAME", value_parser = valid_name)]
+    name: String,
     /// Number of virtual CPUs.
     #[arg(long, default_value_t = 6, value_parser = clap::value_parser!(u32).range(1..=64))]
     cpu_count: u32,
@@ -98,8 +106,8 @@ struct InstallOptions {
     #[arg(long, default_value_t = 24, value_parser = clap::value_parser!(u32).range(4..=256))]
     memory_gb: u32,
     /// Virtual disk size in decimal GB.
-    #[arg(long, default_value_t = 192, value_parser = clap::value_parser!(u32).range(50..=10_000))]
-    disk_gb: u32,
+    #[arg(long, default_value_t = 192, value_parser = clap::value_parser!(u64).range(50..))]
+    disk_gb: u64,
     /// Guest account short name.
     #[arg(long, default_value = "admin", value_parser = valid_user)]
     guest_user: String,
@@ -117,7 +125,7 @@ struct Config {
     guest_user: String,
     cpu_count: u32,
     memory_gb: u32,
-    disk_gb: u32,
+    disk_gb: u64,
     storage: Storage,
 }
 
@@ -150,7 +158,7 @@ struct StoredConfig {
     guest_user: String,
     cpu_count: u32,
     memory_gb: u32,
-    disk_gb: u32,
+    disk_gb: u64,
     storage: StoredStorage,
 }
 
@@ -185,8 +193,7 @@ enum PasswordChoice {
 #[derive(Clone, Copy)]
 enum InstallPlan {
     Create,
-    UpdateEnabled,
-    UpdateDisabled,
+    Update,
 }
 
 impl InstallOptions {
@@ -225,9 +232,18 @@ impl InstallOptions {
                 }
             }
         };
+        let vm_name = match &paths.identity {
+            Identity::Gremvm if paths.config_file.exists() => {
+                Config::load(paths)
+                    .context("persisted configuration is invalid")?
+                    .vm_name
+            }
+            Identity::Gremvm => "gremvm".into(),
+            Identity::Named(name) => name.clone(),
+        };
         Ok((
             Config {
-                vm_name: self.vm_name,
+                vm_name,
                 guest_user: self.guest_user,
                 cpu_count: self.cpu_count,
                 memory_gb: self.memory_gb,
@@ -270,6 +286,14 @@ impl Config {
             storage,
         };
         valid_name(&config.vm_name).map_err(anyhow::Error::msg)?;
+        match &paths.identity {
+            Identity::Gremvm => {}
+            Identity::Named(name) => ensure!(
+                config.vm_name == *name,
+                "configuration belongs to command '{}', not '{name}'",
+                config.vm_name
+            ),
+        }
         valid_user(&config.guest_user).map_err(anyhow::Error::msg)?;
         match &config.storage {
             Storage::Default => {}
@@ -287,7 +311,7 @@ impl Config {
         }
         ensure!((1..=64).contains(&config.cpu_count), "invalid CPU count");
         ensure!((4..=256).contains(&config.memory_gb), "invalid memory size");
-        ensure!((50..=10_000).contains(&config.disk_gb), "invalid disk size");
+        ensure!(config.disk_gb >= 50, "invalid disk size");
         Ok(config)
     }
 
@@ -314,6 +338,7 @@ impl Config {
 }
 
 struct Paths {
+    identity: Identity,
     home: PathBuf,
     root: PathBuf,
     config_dir: PathBuf,
@@ -324,26 +349,31 @@ struct Paths {
     run_marker: PathBuf,
     installing: PathBuf,
     provisioned: PathBuf,
-    launch_agent: PathBuf,
+    service_plist: PathBuf,
     command_link: PathBuf,
     ssh_key: PathBuf,
     guest_tailscale: PathBuf,
+    service_label: String,
+    keychain_helper_label: String,
+    password_service: String,
 }
 
 impl Paths {
-    fn discover() -> Result<Self> {
+    fn discover(name: String) -> Result<Self> {
+        valid_name(&name).map_err(anyhow::Error::msg)?;
         let home = std::env::var_os("HOME")
             .filter(|home| !home.is_empty())
             .map(PathBuf::from)
             .context("HOME is not set")?;
-        let root = home.join("Library/Application Support/GremVM");
+        let instance = resolve(&home, name);
+        let root = instance.root;
         let config_dir = root.join("config");
         let state = root.join("state");
         Ok(Self {
-            command_link: home.join(".local/bin/gremvm"),
-            launch_agent: home
-                .join("Library/LaunchAgents")
-                .join(format!("{LABEL}.plist")),
+            command_link: home
+                .join(".local/bin")
+                .join(instance.identity.command_name()),
+            service_plist: state.join("service.plist"),
             runtime: root.join("runtime"),
             run_marker: state.join("run"),
             installing: state.join("installing"),
@@ -356,11 +386,40 @@ impl Paths {
             config_file: config_dir.join("config.json"),
             config_dir,
             state,
+            identity: instance.identity,
+            password_service: instance.password_service,
+            service_label: instance.service_label,
+            keychain_helper_label: instance.keychain_helper_label,
         })
     }
 
     fn bin(&self, name: &str) -> PathBuf {
         self.runtime.join("bin").join(name)
+    }
+
+    fn command_name(&self) -> &str {
+        self.identity.command_name()
+    }
+
+    fn service_target(&self) -> String {
+        format!("{}/{}", user_domain(), self.service_label)
+    }
+
+    fn keychain_helper_target(&self) -> String {
+        format!("{}/{}", user_domain(), self.keychain_helper_label)
+    }
+
+    fn install_hint(&self) -> String {
+        format!(
+            "nix run github:jul-sh/gremvm -- install {}",
+            self.command_name()
+        )
+    }
+
+    fn autoload_agent(&self) -> PathBuf {
+        self.home
+            .join("Library/LaunchAgents")
+            .join(format!("{}.plist", self.service_label))
     }
 }
 
@@ -436,7 +495,7 @@ struct ConsoleSession {
 #[derive(Serialize)]
 #[serde(rename_all = "PascalCase")]
 struct AgentPlist {
-    label: &'static str,
+    label: String,
     program_arguments: Vec<String>,
     environment_variables: BTreeMap<&'static str, String>,
     keep_alive: KeepAlive,
@@ -456,7 +515,7 @@ struct KeepAlive {
 #[derive(Serialize)]
 #[serde(rename_all = "PascalCase")]
 struct KeychainHelperPlist {
-    label: &'static str,
+    label: String,
     program_arguments: Vec<String>,
     environment_variables: BTreeMap<&'static str, String>,
     limit_load_to_session_type: &'static str,
@@ -532,12 +591,24 @@ struct App {
     config: Config,
 }
 
+pub fn command_name() -> String {
+    std::env::args_os()
+        .next()
+        .and_then(|path| {
+            PathBuf::from(path)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "gremvm".into())
+}
+
 pub fn run() -> Result<()> {
     let command = Action::parse();
-    let paths = Paths::discover()?;
+    let name = command_name();
+    valid_name(&name).map_err(anyhow::Error::msg)?;
+    let paths = Paths::discover(name)?;
     let _lock = match &command {
-        Action::Install(_)
-        | Action::Start
+        Action::Start
         | Action::Stop
         | Action::Restart
         | Action::Console
@@ -548,10 +619,6 @@ pub fn run() -> Result<()> {
         _ => None,
     };
     match command {
-        Action::Install(options) => {
-            let (config, password) = options.resolve(&paths)?;
-            App { paths, config }.install(password)
-        }
         Action::InternalKeychain { mode } => internal_keychain(&paths, mode),
         Action::Status if !is_executable(&paths.bin("tart")) => {
             println!("state: not-installed");
@@ -560,7 +627,8 @@ pub fn run() -> Result<()> {
         command => {
             ensure!(
                 paths.config_file.is_file(),
-                "configuration is missing; run 'gremvm install'"
+                "configuration is missing; run '{}'",
+                paths.install_hint()
             );
             App {
                 config: Config::load(&paths).context("persisted configuration is invalid")?,
@@ -571,10 +639,17 @@ pub fn run() -> Result<()> {
     }
 }
 
+pub fn run_installer() -> Result<()> {
+    let InstallerAction::Install(options) = InstallerAction::parse();
+    let paths = Paths::discover(options.name.clone())?;
+    let _lock = management_lock(&paths)?;
+    let (config, password) = options.resolve(&paths)?;
+    App { paths, config }.install(password)
+}
+
 impl App {
     fn dispatch(&self, command: Action) -> Result<()> {
         match command {
-            Action::Install(_) => unreachable!(),
             Action::Status => self.status(),
             Action::Start => self.start(),
             Action::Stop => self.stop(),
@@ -601,17 +676,12 @@ impl App {
         let plan = self.install_plan()?;
         let policy = match plan {
             InstallPlan::Create => CredentialPolicy::CreateIfMissing,
-            InstallPlan::UpdateEnabled | InstallPlan::UpdateDisabled => CredentialPolicy::Existing,
+            InstallPlan::Update => CredentialPolicy::Existing,
         };
         self.install_ssh_key(policy)?;
         self.prepare_guest_password(policy, password)?;
-        match plan {
-            InstallPlan::Create | InstallPlan::UpdateEnabled => {
-                self.ensure_keychain(KeychainMode::BackgroundInteractive)?;
-            }
-            InstallPlan::UpdateDisabled => {}
-        }
         self.config.persist(&self.paths)?;
+        remove_if_present(&self.paths.run_marker)?;
         self.install_service()?;
         if let InstallPlan::Create = plan {
             remove_if_present(&self.paths.provisioned)?;
@@ -625,21 +695,10 @@ impl App {
             touch(&self.paths.provisioned)?;
             remove_if_present(&self.paths.installing)?;
         }
+        self.stop_tart()?;
         println!("installed: {}", self.paths.command_link.display());
-        match plan {
-            InstallPlan::Create | InstallPlan::UpdateEnabled => {
-                touch(&self.paths.run_marker)?;
-                self.start_service()?;
-                println!(
-                    "ready: {}@{}",
-                    self.config.guest_user,
-                    self.wait_for_ssh(300)?
-                );
-            }
-            InstallPlan::UpdateDisabled => {
-                println!("VM: {} (stopped)", self.config.vm_name);
-            }
-        }
+        println!("VM: {} (stopped)", self.config.vm_name);
+        println!("next: {} start", self.paths.command_name());
         Ok(())
     }
 
@@ -658,15 +717,12 @@ impl App {
             VmInstallation::Ready => {
                 self.verify_config()?;
                 remove_if_present(&self.paths.installing)?;
-                if self.paths.run_marker.exists() {
-                    Ok(InstallPlan::UpdateEnabled)
-                } else {
-                    Ok(InstallPlan::UpdateDisabled)
-                }
+                Ok(InstallPlan::Update)
             }
             VmInstallation::Unmanaged => bail!(
-                "a VM named '{}' exists but was not created by GremVM; rename or remove it before rerunning 'gremvm install'",
-                self.config.vm_name
+                "a VM named '{}' exists but was not created by GremVM; rename or remove it before rerunning '{}'",
+                self.config.vm_name,
+                self.paths.install_hint()
             ),
         }
     }
@@ -794,7 +850,7 @@ impl App {
     ) -> Result<()> {
         self.ensure_keychain(KeychainMode::Current)?;
         if self
-            .keychain_password(&self.config.guest_user, PASSWORD_SERVICE)?
+            .keychain_password(&self.config.guest_user, &self.paths.password_service)?
             .is_some()
         {
             self.guest_password()?;
@@ -809,7 +865,7 @@ impl App {
             let password = prompt_guest_password()?;
             return self.store_keychain_password(
                 &self.config.guest_user,
-                PASSWORD_SERVICE,
+                &self.paths.password_service,
                 &password,
             );
         }
@@ -817,7 +873,7 @@ impl App {
         getrandom::fill(&mut random)?;
         self.store_keychain_password(
             &self.config.guest_user,
-            PASSWORD_SERVICE,
+            &self.paths.password_service,
             &hex::encode(random),
         )
     }
@@ -825,7 +881,7 @@ impl App {
     fn guest_password(&self) -> Result<String> {
         self.ensure_keychain(KeychainMode::Current)?;
         let bytes = self
-            .keychain_password(&self.config.guest_user, PASSWORD_SERVICE)?
+            .keychain_password(&self.config.guest_user, &self.paths.password_service)?
             .context("the guest password is missing from Keychain")?;
         let password =
             String::from_utf8(bytes).context("the stored guest password is not UTF-8")?;
@@ -888,7 +944,7 @@ impl App {
     fn install_service(&self) -> Result<()> {
         let parent = self
             .paths
-            .launch_agent
+            .service_plist
             .parent()
             .context("invalid LaunchAgent path")?;
         for directory in [parent, &self.paths.logs, &self.paths.state] {
@@ -901,8 +957,8 @@ impl App {
         };
         let runtime = string(&self.paths.runtime)?;
         let plist = AgentPlist {
-            label: LABEL,
-            program_arguments: vec![string(&self.paths.bin("gremvm"))?, "internal-run".into()],
+            label: self.paths.service_label.clone(),
+            program_arguments: vec![string(&self.paths.command_link)?, "internal-run".into()],
             environment_variables: BTreeMap::from([
                 ("HOME", string(&self.paths.home)?),
                 (
@@ -926,7 +982,7 @@ impl App {
             .as_file()
             .set_permissions(fs::Permissions::from_mode(0o644))?;
         temporary.as_file().sync_all()?;
-        let target = service_target();
+        let target = self.paths.service_target();
         if self.service_loaded(&target)? {
             self.launchctl(&["bootout", &target], "unload the service")?;
             let deadline = Instant::now() + Duration::from_secs(5);
@@ -935,7 +991,8 @@ impl App {
                 thread::sleep(Duration::from_millis(50));
             }
         }
-        temporary.persist(&self.paths.launch_agent)?;
+        remove_if_present(&self.paths.autoload_agent())?;
+        temporary.persist(&self.paths.service_plist)?;
         Ok(())
     }
 
@@ -959,13 +1016,13 @@ impl App {
     }
 
     fn bootstrap(&self) -> Result<()> {
-        if !self.service_loaded(&service_target())? {
+        if !self.service_loaded(&self.paths.service_target())? {
             self.launchctl(
                 &[
                     "bootstrap",
                     &user_domain(),
                     self.paths
-                        .launch_agent
+                        .service_plist
                         .to_str()
                         .context("LaunchAgent path is not UTF-8")?,
                 ],
@@ -977,7 +1034,10 @@ impl App {
 
     fn start_service(&self) -> Result<()> {
         self.bootstrap()?;
-        self.launchctl(&["kickstart", &service_target()], "start the service")
+        self.launchctl(
+            &["kickstart", &self.paths.service_target()],
+            "start the service",
+        )
     }
 
     fn build_vm(&self) -> Result<()> {
@@ -999,11 +1059,18 @@ impl App {
             )?,
             VmState::Stopped => {}
         }
+        self.delete_vm()
+    }
+
+    fn delete_vm(&self) -> Result<()> {
+        if !self.vm_exists()? {
+            return Ok(());
+        }
         success(
             self.tart()?.args(["delete", &self.config.vm_name]),
-            "delete the incomplete VM",
+            "delete the VM",
         )?;
-        ensure!(!self.vm_exists()?, "Tart did not delete the incomplete VM");
+        ensure!(!self.vm_exists()?, "Tart did not delete the VM");
         Ok(())
     }
 
@@ -1052,7 +1119,8 @@ impl App {
             KeychainMode::BackgroundInteractive => self.ensure_background_keychain()?,
             KeychainMode::Background => ensure!(
                 keychain_unlocked(&self.paths)?,
-                "the host login Keychain is locked; run 'gremvm start' from an interactive terminal"
+                "the host login Keychain is locked; run '{} start' from an interactive terminal",
+                self.paths.command_name()
             ),
         }
         Ok(())
@@ -1114,9 +1182,9 @@ impl App {
                 .with_context(|| format!("path is not UTF-8: {}", path.display()))
         };
         let plist = KeychainHelperPlist {
-            label: KEYCHAIN_HELPER_LABEL,
+            label: self.paths.keychain_helper_label.clone(),
             program_arguments: vec![
-                string(&std::env::current_exe()?)?,
+                string(&self.paths.command_link)?,
                 "internal-keychain".into(),
                 mode.into(),
             ],
@@ -1176,20 +1244,12 @@ impl App {
     }
 
     fn cleanup_keychain_helper(&self) -> Result<()> {
-        let target = format!("{}/{KEYCHAIN_HELPER_LABEL}", user_domain());
+        let target = self.paths.keychain_helper_target();
         if self.service_loaded(&target)? {
             self.launchctl(&["bootout", &target], "unload the Keychain helper")?;
         }
         remove_if_present(&self.paths.state.join("keychain.plist"))?;
         remove_if_present(&self.paths.state.join("keychain.result"))
-    }
-
-    fn tart_home(&self) -> PathBuf {
-        match &self.config.storage {
-            Storage::Default => self.paths.home.join(".tart"),
-            Storage::Directory { path } => path.clone(),
-            Storage::PlainVolume(volume) | Storage::EncryptedVolume(volume) => volume.path.clone(),
-        }
     }
 
     fn ensure_directory(&self, path: &Path) -> Result<()> {
@@ -1247,9 +1307,10 @@ impl App {
                 self.ensure_keychain(KeychainMode::Background)?;
                 VolumeUnlock::Password(
                     self.keychain_password(uuid, VOLUME_PASSWORD_SERVICE)?
-                        .context(
-                            "encrypted volume credential is missing; run 'gremvm start' interactively",
-                        )?,
+                        .context(format!(
+                            "encrypted volume credential is missing; run '{} start' interactively",
+                            self.paths.command_name()
+                        ))?,
                 )
             }
         };
@@ -1455,7 +1516,7 @@ impl App {
             "VM memory differs from configuration"
         );
         ensure!(
-            vm.disk == u64::from(self.config.disk_gb),
+            vm.disk == self.config.disk_gb,
             "VM disk differs from configuration"
         );
         ensure!(vm.os == "darwin", "VM operating system is not macOS");
@@ -1464,19 +1525,22 @@ impl App {
 
     fn preflight_start(&self) -> Result<()> {
         ensure!(
-            self.paths.launch_agent.is_file(),
-            "run 'gremvm install' first"
+            self.paths.service_plist.is_file(),
+            "run '{}' first",
+            self.paths.install_hint()
         );
         self.ensure_keychain(KeychainMode::Current)?;
         self.ensure_keychain(KeychainMode::BackgroundInteractive)?;
         self.ensure_storage(StorageAccess::Interactive)?;
         ensure!(
             self.vm_exists()?,
-            "VM does not exist; rerun 'gremvm install'"
+            "VM does not exist; rerun '{}'",
+            self.paths.install_hint()
         );
         ensure!(
             self.paths.provisioned.exists(),
-            "VM installation is incomplete; rerun 'gremvm install'"
+            "VM installation is incomplete; rerun '{}'",
+            self.paths.install_hint()
         );
         self.verify_config()?;
         validate_bridge()?;
@@ -1543,7 +1607,7 @@ impl App {
         } else {
             None
         };
-        let target = service_target();
+        let target = self.paths.service_target();
         if self.service_loaded(&target)? {
             self.launchctl(&["bootout", &target], "unload the service")?;
         }
@@ -1590,7 +1654,7 @@ impl App {
             }
             VmState::Stopped => ConsoleSource::ColdBoot,
         };
-        let target = service_target();
+        let target = self.paths.service_target();
         if self.service_loaded(&target)? {
             self.launchctl(&["bootout", &target], "unload the service")?;
         }
@@ -1699,16 +1763,21 @@ impl App {
         self.ensure_storage(StorageAccess::Background)?;
         ensure!(
             self.vm_exists()?,
-            "VM does not exist; rerun 'gremvm install'"
+            "VM does not exist; rerun '{}'",
+            self.paths.install_hint()
         );
         ensure!(
             self.paths.provisioned.exists(),
-            "VM installation is incomplete; rerun 'gremvm install'"
+            "VM installation is incomplete; rerun '{}'",
+            self.paths.install_hint()
         );
         match self.vm_info()?.state {
             VmState::Running => {}
             VmState::Suspended | VmState::Stopped => {
-                bail!("VM is not running; run 'gremvm start'")
+                bail!(
+                    "VM is not running; run '{} start'",
+                    self.paths.command_name()
+                )
             }
         }
         let ip = self.wait_for_ssh(120)?;
@@ -1820,11 +1889,11 @@ impl App {
         match self.tailscale_state(ip)? {
             TailscaleState::NotInstalled => {
                 println!("tailscale: not-installed");
-                println!("next: gremvm tailscale setup");
+                println!("next: {} tailscale setup", self.paths.command_name());
             }
             TailscaleState::Disconnected => {
                 println!("tailscale: disconnected");
-                println!("next: gremvm tailscale setup");
+                println!("next: {} tailscale setup", self.paths.command_name());
             }
             TailscaleState::Connected { ip } => {
                 println!("tailscale: connected");
@@ -1870,20 +1939,25 @@ impl App {
         self.ensure_storage(StorageAccess::Background)?;
         ensure!(
             self.vm_exists()?,
-            "VM does not exist; rerun 'gremvm install'"
+            "VM does not exist; rerun '{}'",
+            self.paths.install_hint()
         );
         ensure!(
             self.paths.provisioned.exists(),
-            "VM installation is incomplete; rerun 'gremvm install'"
+            "VM installation is incomplete; rerun '{}'",
+            self.paths.install_hint()
         );
         match self.vm_info()?.state {
             VmState::Running => {}
             VmState::Suspended | VmState::Stopped => {
-                bail!("VM is not running; run 'gremvm start'")
+                bail!(
+                    "VM is not running; run '{} start'",
+                    self.paths.command_name()
+                )
             }
         }
         let ip = self.vm_ip(120)?;
-        ensure_graphical_session("screen-share")?;
+        ensure_graphical_session(self.paths.command_name(), "screen-share")?;
         success(
             Command::new("/usr/bin/open").arg(format!("vnc://{ip}")),
             "open guest Screen Sharing",
@@ -1893,10 +1967,11 @@ impl App {
     }
 
     fn console(&self) -> Result<()> {
-        ensure_console_session()?;
+        ensure_console_session(self.paths.command_name())?;
         self.clear_keychain_helper()?;
         self.ensure_keychain(KeychainMode::Current)?;
-        let resume_background = self.paths.run_marker.exists();
+        let resume_background =
+            self.paths.run_marker.exists() && self.service_loaded(&self.paths.service_target())?;
         if resume_background {
             self.ensure_keychain(KeychainMode::BackgroundInteractive)?;
         }
@@ -1915,9 +1990,9 @@ impl App {
         }
         let mut signals = Signals::new(TERM_SIGNALS.iter().copied().chain([SIGHUP]))?;
         let console = (|| {
-            ensure_console_session()?;
+            ensure_console_session(self.paths.command_name())?;
             self.prepare_console(resume_background)?;
-            ensure_console_session()?;
+            ensure_console_session(self.paths.command_name())?;
             ensure!(
                 signals.pending().next().is_none(),
                 "console launch was interrupted"
@@ -1943,7 +2018,7 @@ impl App {
                     break status;
                 }
                 if signals.pending().next().is_some() {
-                    ensure_console_session()?;
+                    ensure_console_session(self.paths.command_name())?;
                     break self.suspend_console_process(&mut child)?;
                 }
                 thread::sleep(Duration::from_millis(100));
@@ -1959,7 +2034,10 @@ impl App {
         if let Err(error) = console {
             return if resume_background {
                 Err(error.context(
-                    "background restart was withheld to avoid a cold boot; inspect the VM, then run 'gremvm start' when ready",
+                    format!(
+                        "background restart was withheld to avoid a cold boot; inspect the VM, then run '{} start' when ready",
+                        self.paths.command_name()
+                    ),
                 ))
             } else {
                 Err(error)
@@ -1988,7 +2066,9 @@ impl App {
             VmState::Running => self.vm_ip(0).ok(),
             VmState::Suspended | VmState::Stopped => None,
         };
-        let state = match (vm.state, ip.as_deref(), self.paths.run_marker.exists()) {
+        let supervised =
+            self.paths.run_marker.exists() && self.service_loaded(&self.paths.service_target())?;
+        let state = match (vm.state, ip.as_deref(), supervised) {
             (_, _, _) if !self.paths.provisioned.exists() => "incomplete",
             (VmState::Running, Some(_), _) => "running",
             (VmState::Running, None, _) => "running-address-unknown",
@@ -2022,8 +2102,11 @@ impl App {
     }
 
     fn uninstall(&self) -> Result<()> {
-        let stop = self.stop_vm();
-        remove_if_present(&self.paths.launch_agent)?;
+        self.ensure_storage(StorageAccess::Interactive)?;
+        self.stop_vm()?;
+        self.delete_vm()?;
+        remove_if_present(&self.paths.service_plist)?;
+        remove_if_present(&self.paths.autoload_agent())?;
         if fs::symlink_metadata(&self.paths.command_link)
             .is_ok_and(|metadata| metadata.file_type().is_symlink())
             && fs::read_link(&self.paths.command_link)? == self.paths.bin("gremvm")
@@ -2031,14 +2114,7 @@ impl App {
             remove_if_present(&self.paths.command_link)?;
         }
         remove_if_present(&self.paths.runtime)?;
-        stop?;
-        println!(
-            "uninstalled; VM data preserved at {}",
-            self.tart_home()
-                .join("vms")
-                .join(&self.config.vm_name)
-                .display()
-        );
+        println!("uninstalled: {}", self.config.vm_name);
         Ok(())
     }
 
@@ -2166,7 +2242,8 @@ fn management_lock(paths: &Paths) -> Result<fs::File> {
         .open(paths.state.join("management.lock"))?;
     ensure!(
         unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
-        "another gremvm management command is running"
+        "another {} management command is running",
+        paths.command_name()
     );
     Ok(lock)
 }
@@ -2378,16 +2455,16 @@ fn launchd_session() -> Result<String> {
     )
 }
 
-fn ensure_graphical_session(command: &str) -> Result<()> {
+fn ensure_graphical_session(name: &str, command: &str) -> Result<()> {
     ensure!(
         launchd_session()? == "Aqua",
-        "gremvm {command} requires an active graphical host session"
+        "{name} {command} requires an active graphical host session"
     );
     Ok(())
 }
 
-fn ensure_console_session() -> Result<()> {
-    ensure_graphical_session("console")?;
+fn ensure_console_session(name: &str) -> Result<()> {
+    ensure_graphical_session(name, "console")?;
     let output = Command::new("/usr/sbin/ioreg")
         .args(["-n", "Root", "-d1", "-a"])
         .output()
@@ -2403,13 +2480,9 @@ fn ensure_console_session() -> Result<()> {
         .context("the current user has no on-console graphical host session")?;
     ensure!(
         !console.locked && session.login_done && !session.screen_locked,
-        "gremvm console requires this user's on-console graphical session to be unlocked so macOS can encrypt the VM snapshot"
+        "{name} console requires this user's on-console graphical session to be unlocked so macOS can encrypt the VM snapshot"
     );
     Ok(())
-}
-
-fn service_target() -> String {
-    format!("{}/{LABEL}", user_domain())
 }
 
 fn remove_if_present(path: &Path) -> Result<()> {
