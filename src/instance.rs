@@ -7,6 +7,13 @@ pub(crate) enum Identity {
 }
 
 impl Identity {
+    pub(crate) fn from_name(name: String) -> Self {
+        match name.as_str() {
+            "gremvm" => Self::Gremvm,
+            _ => Self::Named(name),
+        }
+    }
+
     pub(crate) fn command_name(&self) -> &str {
         match self {
             Self::Gremvm => "gremvm",
@@ -26,16 +33,11 @@ pub(crate) struct Instance {
 
 pub(crate) fn resolve(home: &Path, name: String) -> Instance {
     let base = home.join("Library/Application Support/GremVM");
-    let (identity, root, service_label, keychain_helper_label) = match name.as_str() {
-        "gremvm" => (
-            Identity::Gremvm,
-            base,
-            "io.gremvm.tart".into(),
-            "io.gremvm.keychain".into(),
-        ),
-        _ => (
-            Identity::Named(name.clone()),
-            base.join("instances").join(&name),
+    let identity = Identity::from_name(name);
+    let (root, service_label, keychain_helper_label) = match &identity {
+        Identity::Gremvm => (base, "io.gremvm.tart".into(), "io.gremvm.keychain".into()),
+        Identity::Named(name) => (
+            base.join("instances").join(name),
             format!("io.gremvm.tart.{name}"),
             format!("io.gremvm.keychain.{name}"),
         ),

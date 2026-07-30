@@ -65,7 +65,7 @@ enum Action {
         #[arg(long)]
         follow: bool,
     },
-    /// Remove the service and runtime, preserving VM data.
+    /// Delete the VM and remove its service and runtime.
     Uninstall,
     #[command(name = "internal-run", hide = true)]
     InternalRun,
@@ -86,9 +86,9 @@ enum TailscaleAction {
 
 #[derive(Args)]
 struct InstallOptions {
-    /// VM name and command to install. Defaults to this command's name.
+    /// VM and command name to install.
     #[arg(value_name = "NAME", value_parser = valid_name)]
-    name: Option<String>,
+    name: String,
     /// Number of virtual CPUs.
     #[arg(long, default_value_t = 6, value_parser = clap::value_parser!(u32).range(1..=64))]
     cpu_count: u32,
@@ -399,6 +399,10 @@ impl Paths {
         format!("{}/{}", user_domain(), self.keychain_helper_label)
     }
 
+    fn install_hint(&self) -> String {
+        format!("{} install {}", self.command_name(), self.command_name())
+    }
+
     fn autoload_agent(&self) -> PathBuf {
         self.home
             .join("Library/LaunchAgents")
@@ -589,9 +593,19 @@ pub fn run() -> Result<()> {
     let command = Action::parse();
     let invoked = command_name();
     valid_name(&invoked).map_err(anyhow::Error::msg)?;
-    let name = match &command {
-        Action::Install(options) => options.name.clone().unwrap_or(invoked),
-        _ => invoked,
+    let invoked = Identity::from_name(invoked);
+    let name = match (&command, &invoked) {
+        (Action::Install(options), Identity::Gremvm) => options.name.clone(),
+        (Action::Install(options), Identity::Named(name)) => {
+            ensure!(
+                options.name == *name,
+                "install name '{}' does not match command '{}'",
+                options.name,
+                name
+            );
+            options.name.clone()
+        }
+        _ => invoked.command_name().to_owned(),
     };
     let paths = Paths::discover(name)?;
     let _lock = match &command {
@@ -619,8 +633,8 @@ pub fn run() -> Result<()> {
         command => {
             ensure!(
                 paths.config_file.is_file(),
-                "configuration is missing; run '{} install'",
-                paths.command_name()
+                "configuration is missing; run '{}'",
+                paths.install_hint()
             );
             App {
                 config: Config::load(&paths).context("persisted configuration is invalid")?,
@@ -705,9 +719,9 @@ impl App {
                 Ok(InstallPlan::Update)
             }
             VmInstallation::Unmanaged => bail!(
-                "a VM named '{}' exists but was not created by GremVM; rename or remove it before rerunning '{} install'",
+                "a VM named '{}' exists but was not created by GremVM; rename or remove it before rerunning '{}'",
                 self.config.vm_name,
-                self.paths.command_name()
+                self.paths.install_hint()
             ),
         }
     }
@@ -1044,11 +1058,18 @@ impl App {
             )?,
             VmState::Stopped => {}
         }
+        self.delete_vm()
+    }
+
+    fn delete_vm(&self) -> Result<()> {
+        if !self.vm_exists()? {
+            return Ok(());
+        }
         success(
             self.tart()?.args(["delete", &self.config.vm_name]),
-            "delete the incomplete VM",
+            "delete the VM",
         )?;
-        ensure!(!self.vm_exists()?, "Tart did not delete the incomplete VM");
+        ensure!(!self.vm_exists()?, "Tart did not delete the VM");
         Ok(())
     }
 
@@ -1228,14 +1249,6 @@ impl App {
         }
         remove_if_present(&self.paths.state.join("keychain.plist"))?;
         remove_if_present(&self.paths.state.join("keychain.result"))
-    }
-
-    fn tart_home(&self) -> PathBuf {
-        match &self.config.storage {
-            Storage::Default => self.paths.home.join(".tart"),
-            Storage::Directory { path } => path.clone(),
-            Storage::PlainVolume(volume) | Storage::EncryptedVolume(volume) => volume.path.clone(),
-        }
     }
 
     fn ensure_directory(&self, path: &Path) -> Result<()> {
@@ -1512,21 +1525,21 @@ impl App {
     fn preflight_start(&self) -> Result<()> {
         ensure!(
             self.paths.service_plist.is_file(),
-            "run '{} install' first",
-            self.paths.command_name()
+            "run '{}' first",
+            self.paths.install_hint()
         );
         self.ensure_keychain(KeychainMode::Current)?;
         self.ensure_keychain(KeychainMode::BackgroundInteractive)?;
         self.ensure_storage(StorageAccess::Interactive)?;
         ensure!(
             self.vm_exists()?,
-            "VM does not exist; rerun '{} install'",
-            self.paths.command_name()
+            "VM does not exist; rerun '{}'",
+            self.paths.install_hint()
         );
         ensure!(
             self.paths.provisioned.exists(),
-            "VM installation is incomplete; rerun '{} install'",
-            self.paths.command_name()
+            "VM installation is incomplete; rerun '{}'",
+            self.paths.install_hint()
         );
         self.verify_config()?;
         validate_bridge()?;
@@ -1749,13 +1762,13 @@ impl App {
         self.ensure_storage(StorageAccess::Background)?;
         ensure!(
             self.vm_exists()?,
-            "VM does not exist; rerun '{} install'",
-            self.paths.command_name()
+            "VM does not exist; rerun '{}'",
+            self.paths.install_hint()
         );
         ensure!(
             self.paths.provisioned.exists(),
-            "VM installation is incomplete; rerun '{} install'",
-            self.paths.command_name()
+            "VM installation is incomplete; rerun '{}'",
+            self.paths.install_hint()
         );
         match self.vm_info()?.state {
             VmState::Running => {}
@@ -1925,13 +1938,13 @@ impl App {
         self.ensure_storage(StorageAccess::Background)?;
         ensure!(
             self.vm_exists()?,
-            "VM does not exist; rerun '{} install'",
-            self.paths.command_name()
+            "VM does not exist; rerun '{}'",
+            self.paths.install_hint()
         );
         ensure!(
             self.paths.provisioned.exists(),
-            "VM installation is incomplete; rerun '{} install'",
-            self.paths.command_name()
+            "VM installation is incomplete; rerun '{}'",
+            self.paths.install_hint()
         );
         match self.vm_info()?.state {
             VmState::Running => {}
@@ -2088,7 +2101,9 @@ impl App {
     }
 
     fn uninstall(&self) -> Result<()> {
-        let stop = self.stop_vm();
+        self.ensure_storage(StorageAccess::Interactive)?;
+        self.stop_vm()?;
+        self.delete_vm()?;
         remove_if_present(&self.paths.service_plist)?;
         remove_if_present(&self.paths.autoload_agent())?;
         if fs::symlink_metadata(&self.paths.command_link)
@@ -2098,14 +2113,7 @@ impl App {
             remove_if_present(&self.paths.command_link)?;
         }
         remove_if_present(&self.paths.runtime)?;
-        stop?;
-        println!(
-            "uninstalled; VM data preserved at {}",
-            self.tart_home()
-                .join("vms")
-                .join(&self.config.vm_name)
-                .display()
-        );
+        println!("uninstalled: {}", self.config.vm_name);
         Ok(())
     }
 
