@@ -38,8 +38,6 @@ This creates the VM and persistent `gremvm` command. The name and options are sa
 
 To run multiple VMs, install another name—for example, `nix run . -- install foovm`; that VM is then managed with `foovm start`, `foovm status`, and the other commands.
 
-Each VM stores its own settings: `gremvm` under `~/Library/Application Support/GremVM/config`, and other names under `~/Library/Application Support/GremVM/instances/<name>/config`. Hardware, guest user, storage, and password are fixed for that VM after creation; a new name can use different settings. Editing the files directly is unsupported.
-
 On the first run, the Nix installer configures the tooling and service, downloads the pinned image, and creates the VM. It leaves the VM stopped; run `gremvm start` when you want to start it. Creation can take several minutes. If it is interrupted, rerun the same command and GremVM will safely retry the incomplete installation.
 
 ### Starting from SSH

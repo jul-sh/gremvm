@@ -13,6 +13,11 @@ fn command_alias(directory: &Path, name: &str) -> PathBuf {
     alias
 }
 
+fn instance_root(home: &Path, name: &str) -> PathBuf {
+    home.join("Library/Application Support/GremVM/instances")
+        .join(name)
+}
+
 #[test]
 fn help_describes_the_public_interface() {
     cargo_bin_cmd!("gremvm-install")
@@ -166,7 +171,7 @@ fn install_rejects_invalid_settings() {
 fn install_accepts_large_disks_and_explicit_storage() {
     let home = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
-    let state = home.path().join("Library/Application Support/GremVM/state");
+    let state = instance_root(home.path(), "gremvm").join("state");
     std::fs::create_dir_all(&state).unwrap();
     let lock = OpenOptions::new()
         .create(true)
@@ -211,7 +216,7 @@ fn an_empty_home_reports_not_installed() {
 #[test]
 fn management_commands_are_serialized() {
     let home = tempfile::tempdir().unwrap();
-    let state = home.path().join("Library/Application Support/GremVM/state");
+    let state = instance_root(home.path(), "gremvm").join("state");
     std::fs::create_dir_all(&state).unwrap();
     let lock = OpenOptions::new()
         .create(true)
@@ -237,9 +242,7 @@ fn named_install_uses_its_own_management_lock() {
     let home = tempfile::tempdir().unwrap();
     let aliases = tempfile::tempdir().unwrap();
     let foovm = command_alias(aliases.path(), "foovm");
-    let state = home
-        .path()
-        .join("Library/Application Support/GremVM/instances/foovm/state");
+    let state = instance_root(home.path(), "foovm").join("state");
     std::fs::create_dir_all(&state).unwrap();
     let lock = OpenOptions::new()
         .create(true)
@@ -278,9 +281,7 @@ fn keychain_helper_publishes_its_result() {
         .assert()
         .success();
 
-    let result = home
-        .path()
-        .join("Library/Application Support/GremVM/state/keychain.result");
+    let result = instance_root(home.path(), "gremvm").join("state/keychain.result");
     assert_eq!(std::fs::read_to_string(result).unwrap(), "locked\n");
 }
 
@@ -354,11 +355,8 @@ exit [lindex $result 3]
         String::from_utf8_lossy(&transcript)
     );
     assert_eq!(
-        std::fs::read_to_string(
-            home.path()
-                .join("Library/Application Support/GremVM/state/keychain.result")
-        )
-        .unwrap(),
+        std::fs::read_to_string(instance_root(home.path(), "gremvm").join("state/keychain.result"))
+            .unwrap(),
         "locked\n"
     );
 }
@@ -366,9 +364,7 @@ exit [lindex $result 3]
 #[test]
 fn malformed_configuration_has_a_clear_error() {
     let home = tempfile::tempdir().unwrap();
-    let config = home
-        .path()
-        .join("Library/Application Support/GremVM/config");
+    let config = instance_root(home.path(), "gremvm").join("config");
     std::fs::create_dir_all(&config).unwrap();
     std::fs::write(config.join("config.json"), "not json\n").unwrap();
 
@@ -399,7 +395,7 @@ fn malformed_configuration_has_a_clear_error() {
 #[test]
 fn volume_configuration_is_strict_but_loads_the_legacy_shape() {
     let home = tempfile::tempdir().unwrap();
-    let root = home.path().join("Library/Application Support/GremVM");
+    let root = instance_root(home.path(), "gremvm");
     let config = root.join("config/config.json");
     std::fs::create_dir_all(config.parent().unwrap()).unwrap();
     std::fs::create_dir_all(root.join("logs")).unwrap();
@@ -456,7 +452,7 @@ fn volume_configuration_is_strict_but_loads_the_legacy_shape() {
 #[test]
 fn default_storage_uses_tarts_normal_home() {
     let home = tempfile::tempdir().unwrap();
-    let root = home.path().join("Library/Application Support/GremVM");
+    let root = instance_root(home.path(), "gremvm");
     let config = root.join("config");
     let tart = root.join("runtime/bin/tart");
     std::fs::create_dir_all(&config).unwrap();
@@ -492,7 +488,7 @@ fn explicit_storage_uses_the_exact_directory() {
     let home = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
     let storage = storage.path().canonicalize().unwrap();
-    let root = home.path().join("Library/Application Support/GremVM");
+    let root = instance_root(home.path(), "gremvm");
     let config = root.join("config");
     let tart = root.join("runtime/bin/tart");
     std::fs::create_dir_all(&config).unwrap();
@@ -535,11 +531,12 @@ fn command_names_select_isolated_vms() {
     let home = tempfile::tempdir().unwrap();
     let aliases = tempfile::tempdir().unwrap();
     let foovm = command_alias(aliases.path(), "foovm");
-    let base = home.path().join("Library/Application Support/GremVM");
+    let gremvm_root = instance_root(home.path(), "gremvm");
+    let foovm_root = instance_root(home.path(), "foovm");
 
     for (root, name, cpu, disk, run) in [
-        (base.clone(), "gremvm", 6, 192, false),
-        (base.join("instances/foovm"), "foovm", 4, 96, true),
+        (gremvm_root.clone(), "gremvm", 6, 192, false),
+        (foovm_root.clone(), "foovm", 4, 96, true),
     ] {
         let config = root.join("config");
         let state = root.join("state");
@@ -608,8 +605,8 @@ fn command_names_select_isolated_vms() {
         .arg("check")
         .assert()
         .success();
-    assert!(base.join("instances/foovm/state/keychain.result").is_file());
-    assert!(!base.join("state/keychain.result").exists());
+    assert!(foovm_root.join("state/keychain.result").is_file());
+    assert!(!gremvm_root.join("state/keychain.result").exists());
 }
 
 #[test]
@@ -619,10 +616,7 @@ fn uninstall_deletes_only_the_selected_vm_data() {
     let bundle = tempfile::tempdir().unwrap();
     let name = format!("testvm{}", std::process::id());
     let command = command_alias(aliases.path(), &name);
-    let root = home
-        .path()
-        .join("Library/Application Support/GremVM/instances")
-        .join(&name);
+    let root = instance_root(home.path(), &name);
     let config = root.join("config");
     let state = root.join("state");
     let logs = root.join("logs");
@@ -715,9 +709,7 @@ fn a_command_cannot_select_another_vms_configuration() {
     let home = tempfile::tempdir().unwrap();
     let aliases = tempfile::tempdir().unwrap();
     let foovm = command_alias(aliases.path(), "foovm");
-    let config = home
-        .path()
-        .join("Library/Application Support/GremVM/instances/foovm/config");
+    let config = instance_root(home.path(), "foovm").join("config");
     std::fs::create_dir_all(&config).unwrap();
     std::fs::write(
         config.join("config.json"),
@@ -738,7 +730,7 @@ fn a_command_cannot_select_another_vms_configuration() {
 #[test]
 fn the_original_command_preserves_legacy_custom_vm_names() {
     let home = tempfile::tempdir().unwrap();
-    let root = home.path().join("Library/Application Support/GremVM");
+    let root = instance_root(home.path(), "gremvm");
     let config = root.join("config");
     let state = root.join("state");
     let tart = root.join("runtime/bin/tart");
@@ -770,7 +762,7 @@ fn the_original_command_preserves_legacy_custom_vm_names() {
 #[test]
 fn suspended_vm_status_is_reported() {
     let home = tempfile::tempdir().unwrap();
-    let root = home.path().join("Library/Application Support/GremVM");
+    let root = instance_root(home.path(), "gremvm");
     let config = root.join("config");
     let state = root.join("state");
     let tart = root.join("runtime/bin/tart");

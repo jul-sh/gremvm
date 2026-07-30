@@ -34,10 +34,10 @@ pub(crate) struct Instance {
 pub(crate) fn resolve(home: &Path, name: String) -> Instance {
     let base = home.join("Library/Application Support/GremVM");
     let identity = Identity::from_name(name);
-    let (root, service_label, keychain_helper_label) = match &identity {
-        Identity::Gremvm => (base, "io.gremvm.tart".into(), "io.gremvm.keychain".into()),
+    let root = base.join("instances").join(identity.command_name());
+    let (service_label, keychain_helper_label) = match &identity {
+        Identity::Gremvm => ("io.gremvm.tart".into(), "io.gremvm.keychain".into()),
         Identity::Named(name) => (
-            base.join("instances").join(name),
             format!("io.gremvm.tart.{name}"),
             format!("io.gremvm.keychain.{name}"),
         ),
