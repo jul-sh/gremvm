@@ -183,8 +183,7 @@ enum PasswordChoice {
 #[derive(Clone, Copy)]
 enum InstallPlan {
     Create,
-    UpdateEnabled,
-    UpdateDisabled,
+    Update,
 }
 
 impl InstallOptions {
@@ -340,7 +339,7 @@ struct Paths {
     run_marker: PathBuf,
     installing: PathBuf,
     provisioned: PathBuf,
-    launch_agent: PathBuf,
+    service_plist: PathBuf,
     command_link: PathBuf,
     ssh_key: PathBuf,
     guest_tailscale: PathBuf,
@@ -364,9 +363,7 @@ impl Paths {
             command_link: home
                 .join(".local/bin")
                 .join(instance.identity.command_name()),
-            launch_agent: home
-                .join("Library/LaunchAgents")
-                .join(format!("{}.plist", instance.service_label)),
+            service_plist: state.join("service.plist"),
             runtime: root.join("runtime"),
             run_marker: state.join("run"),
             installing: state.join("installing"),
@@ -400,6 +397,12 @@ impl Paths {
 
     fn keychain_helper_target(&self) -> String {
         format!("{}/{}", user_domain(), self.keychain_helper_label)
+    }
+
+    fn autoload_agent(&self) -> PathBuf {
+        self.home
+            .join("Library/LaunchAgents")
+            .join(format!("{}.plist", self.service_label))
     }
 }
 
@@ -658,17 +661,12 @@ impl App {
         let plan = self.install_plan()?;
         let policy = match plan {
             InstallPlan::Create => CredentialPolicy::CreateIfMissing,
-            InstallPlan::UpdateEnabled | InstallPlan::UpdateDisabled => CredentialPolicy::Existing,
+            InstallPlan::Update => CredentialPolicy::Existing,
         };
         self.install_ssh_key(policy)?;
         self.prepare_guest_password(policy, password)?;
-        match plan {
-            InstallPlan::Create | InstallPlan::UpdateEnabled => {
-                self.ensure_keychain(KeychainMode::BackgroundInteractive)?;
-            }
-            InstallPlan::UpdateDisabled => {}
-        }
         self.config.persist(&self.paths)?;
+        remove_if_present(&self.paths.run_marker)?;
         self.install_service()?;
         if let InstallPlan::Create = plan {
             remove_if_present(&self.paths.provisioned)?;
@@ -682,21 +680,10 @@ impl App {
             touch(&self.paths.provisioned)?;
             remove_if_present(&self.paths.installing)?;
         }
+        self.stop_tart()?;
         println!("installed: {}", self.paths.command_link.display());
-        match plan {
-            InstallPlan::Create | InstallPlan::UpdateEnabled => {
-                touch(&self.paths.run_marker)?;
-                self.start_service()?;
-                println!(
-                    "ready: {}@{}",
-                    self.config.guest_user,
-                    self.wait_for_ssh(300)?
-                );
-            }
-            InstallPlan::UpdateDisabled => {
-                println!("VM: {} (stopped)", self.config.vm_name);
-            }
-        }
+        println!("VM: {} (stopped)", self.config.vm_name);
+        println!("next: {} start", self.paths.command_name());
         Ok(())
     }
 
@@ -715,11 +702,7 @@ impl App {
             VmInstallation::Ready => {
                 self.verify_config()?;
                 remove_if_present(&self.paths.installing)?;
-                if self.paths.run_marker.exists() {
-                    Ok(InstallPlan::UpdateEnabled)
-                } else {
-                    Ok(InstallPlan::UpdateDisabled)
-                }
+                Ok(InstallPlan::Update)
             }
             VmInstallation::Unmanaged => bail!(
                 "a VM named '{}' exists but was not created by GremVM; rename or remove it before rerunning '{} install'",
@@ -946,7 +929,7 @@ impl App {
     fn install_service(&self) -> Result<()> {
         let parent = self
             .paths
-            .launch_agent
+            .service_plist
             .parent()
             .context("invalid LaunchAgent path")?;
         for directory in [parent, &self.paths.logs, &self.paths.state] {
@@ -993,7 +976,8 @@ impl App {
                 thread::sleep(Duration::from_millis(50));
             }
         }
-        temporary.persist(&self.paths.launch_agent)?;
+        remove_if_present(&self.paths.autoload_agent())?;
+        temporary.persist(&self.paths.service_plist)?;
         Ok(())
     }
 
@@ -1023,7 +1007,7 @@ impl App {
                     "bootstrap",
                     &user_domain(),
                     self.paths
-                        .launch_agent
+                        .service_plist
                         .to_str()
                         .context("LaunchAgent path is not UTF-8")?,
                 ],
@@ -1527,7 +1511,7 @@ impl App {
 
     fn preflight_start(&self) -> Result<()> {
         ensure!(
-            self.paths.launch_agent.is_file(),
+            self.paths.service_plist.is_file(),
             "run '{} install' first",
             self.paths.command_name()
         );
@@ -1972,7 +1956,8 @@ impl App {
         ensure_console_session(self.paths.command_name())?;
         self.clear_keychain_helper()?;
         self.ensure_keychain(KeychainMode::Current)?;
-        let resume_background = self.paths.run_marker.exists();
+        let resume_background =
+            self.paths.run_marker.exists() && self.service_loaded(&self.paths.service_target())?;
         if resume_background {
             self.ensure_keychain(KeychainMode::BackgroundInteractive)?;
         }
@@ -2067,7 +2052,9 @@ impl App {
             VmState::Running => self.vm_ip(0).ok(),
             VmState::Suspended | VmState::Stopped => None,
         };
-        let state = match (vm.state, ip.as_deref(), self.paths.run_marker.exists()) {
+        let supervised =
+            self.paths.run_marker.exists() && self.service_loaded(&self.paths.service_target())?;
+        let state = match (vm.state, ip.as_deref(), supervised) {
             (_, _, _) if !self.paths.provisioned.exists() => "incomplete",
             (VmState::Running, Some(_), _) => "running",
             (VmState::Running, None, _) => "running-address-unknown",
@@ -2102,7 +2089,8 @@ impl App {
 
     fn uninstall(&self) -> Result<()> {
         let stop = self.stop_vm();
-        remove_if_present(&self.paths.launch_agent)?;
+        remove_if_present(&self.paths.service_plist)?;
+        remove_if_present(&self.paths.autoload_agent())?;
         if fs::symlink_metadata(&self.paths.command_link)
             .is_ok_and(|metadata| metadata.file_type().is_symlink())
             && fs::read_link(&self.paths.command_link)? == self.paths.bin("gremvm")

@@ -4,16 +4,16 @@ An agent needs a computer.
 
 You can give it your personal Mac, but then it can damage your files, credentials, and environment. You can create a separate user account, but Macs do not handle multi-tenancy well for development work. You can buy another Mac, but now you need another Mac. A VM is the natural middle ground: isolated, snapshotable, and disposable.
 
-The desired abstraction is simple: one or more extra Macs on your local network.
+The desired abstraction is simple: an extra Mac on your local network.
 
 It should have its own IP address. You should be able to SSH or Screen Share into it. It should keep running when you disconnect and recover when it stops. The fact that it is a VM should mostly disappear.
 
-GremVM approximates this with [Tart](https://tart.run/): persistent macOS Tahoe VMs, supervised by the host and exposed directly to the LAN. Each VM gets its own command and is intended to feel like an always-on Mac for agentic work, without requiring another physical machine.
+GremVM approximates this with [Tart](https://tart.run/): a persistent macOS Tahoe VM, supervised by the host and exposed directly to the LAN. It is intended to feel like an always-on Mac for agentic work, without requiring another physical machine.
 
 ## Behavior
 
-- After a host reboot, SSH into the host and run each VM's `start` command, such as `gremvm start` or `foovm start`.
-- In background mode, the VM continues running after SSH disconnects and restarts after guest shutdowns or Tart failures.
+- The VM does not start merely because the host rebooted or a user logged in through SSH or the GUI. Run `gremvm start` explicitly.
+- After `gremvm start`, the VM continues running after SSH disconnects and restarts after guest shutdowns or Tart failures.
 - Normal Screen Sharing does not change the VM lifecycle.
 - Opening Tart's recovery console preserves the live guest session.
 - The guest keeps a 1512x982-pixel virtual display in background mode.
@@ -28,8 +28,7 @@ GremVM approximates this with [Tart](https://tart.run/): persistent macOS Tahoe 
 - An existing login Keychain for the host account
 - An existing writable directory when using `--storage`; encrypted non-system volumes must use APFS
 - An active `en0` interface connected to the LAN
-- Enough aggregate CPU and memory for every VM that runs concurrently
-- Enough host storage for each VM's initial creation, disk growth, and suspend image, which can approach its configured guest memory
+- Enough host CPU, memory, and storage for the configured VM, including disk growth and a suspend image that can approach the configured guest memory
 
 On macOS 15 and later, Tart requires the host account's login Keychain to be unlocked when a VM starts. See [Tart's headless-machine guidance](https://tart.run/faq/#headless-machines).
 
@@ -38,21 +37,16 @@ On macOS 15 and later, Tart requires the host account's login Keychain to be unl
 From the repository root:
 
 ```sh
-nix run .#gremvm -- install
-nix run .#gremvm -- install foovm
+nix run . -- install
 ```
 
-The first command creates the VM and persistent command `gremvm`; the second creates an independent VM and command named `foovm`. After installation, the command name selects the VM—use `gremvm status` for `gremvm` and `foovm status` for `foovm`. No selector flag is needed.
+This creates the VM and persistent `gremvm` command. To change the defaults, pass the desired flags to `install`; those choices are saved for the VM.
 
-Omit the name to use the current command's name. Pass a name only when bootstrapping another VM. Names are 1–64 letters, numbers, dots, underscores, or hyphens and must start with a letter or number.
+On the first run, `install` configures the tooling and service, downloads the pinned image, and creates the VM. It leaves the VM stopped; run `gremvm start` when you want to start it. Creation can take several minutes. If it is interrupted, rerun the same command and GremVM will safely retry the incomplete installation.
 
-These commands use the defaults below. To change them, pass the desired flags to `install`; that choice is saved for that VM. On the first run, `install` configures the tooling and service, downloads the pinned image, creates the VM, starts it, and waits for SSH. This can take several minutes. If VM creation is interrupted, rerun the same command and GremVM will safely retry its incomplete installation.
-
-Rerunning the same `install` command updates and verifies the managed tooling without rebuilding the VM. It preserves whether an existing VM was running or intentionally stopped.
+Rerunning `install` updates and verifies the managed tooling without rebuilding the VM. It also leaves the VM stopped, so start it explicitly afterward.
 
 On macOS 15 and later, Packer may trigger a one-time Local Network privacy prompt. For the first installation without a graphical session, apply [Tart's documented noninteractive workaround](https://tart.run/faq/#avoiding-the-local-network-permission-pop-up) before running `install`.
-
-Each installation creates `~/.local/bin/<name>`. Configuration, state, logs, runtime, SSH keys, launchd services, and guest passwords are isolated per command. Existing singleton installations keep their original paths, services, credentials, and `gremvm` command—even when an older `--vm-name` selected a different Tart VM name. New installations always make the VM name and command name identical.
 
 ### Starting from SSH
 
@@ -62,7 +56,7 @@ After a host reboot without a graphical login, SSH into the host and run:
 gremvm start
 ```
 
-An SSH login alone does not start the VM. `start` explicitly loads the service into `user/<uid>`, starts it, and waits for guest SSH. Once it succeeds, disconnecting from the host does not stop the VM.
+An SSH or GUI login alone does not start the VM. `start` explicitly loads the service into `user/<uid>`, starts it, and waits for guest SSH. Once it succeeds, disconnecting from the host does not stop the VM.
 
 [Apple-silicon Macs on macOS 26 or later can unlock FileVault over SSH](https://support.apple.com/guide/deployment/intro-to-filevault-dep82064ec40/web) when Remote Login and a supported network connection are available. After the host finishes booting, run `gremvm start` as above.
 
@@ -70,11 +64,10 @@ If the host login Keychain needs unlocking, `start` asks for the host account pa
 
 ## Configuration
 
-Configuration is accepted as an optional install name followed by flags:
+Configuration is accepted as flags to `install`:
 
-| Argument or flag | Default | Accepted values |
+| Flag | Default | Accepted values |
 | --- | --- | --- |
-| `[NAME]` | Current command name | 1–64 letters, numbers, dots, underscores, or hyphens; starts with a letter or number |
 | `--cpu-count` | `6` | 1–64 |
 | `--memory-gb` | `24` GiB | 4–256 GiB |
 | `--disk-gb` | `192` GB | 50 GB or more |
@@ -85,8 +78,7 @@ Configuration is accepted as an optional install name followed by flags:
 For example, assuming `/Volumes/BuildVM/gremvm` already exists:
 
 ```sh
-nix run .#gremvm -- install \
-  build-vm \
+nix run . -- install \
   --cpu-count 8 \
   --memory-gb 32 \
   --disk-gb 500 \
@@ -97,12 +89,12 @@ nix run .#gremvm -- install \
 
 Without `--ask-password`, GremVM generates the initial guest password. Either way, it stores the password in the host login Keychain rather than in the configuration file or command line.
 
-The first `gremvm` install saves settings in `~/Library/Application Support/GremVM/config/config.json`; other commands use `~/Library/Application Support/GremVM/instances/<name>/config/config.json`. The VM/command name, hardware, guest user, storage path, and guest password are creation-time choices. Subsequent installs must use the same settings, and GremVM does not reconfigure an existing VM or rotate its password. Editing configuration files is unsupported.
+Settings are saved in `~/Library/Application Support/GremVM/config/config.json`. The hardware, guest user, storage path, and guest password are creation-time choices. Subsequent installs must use the same settings, and GremVM does not reconfigure an existing VM or rotate its password. Editing the configuration file is unsupported.
 
 ## Commands
 
 ```sh
-gremvm install [name] [options]
+gremvm install [options]
 gremvm status
 gremvm ssh
 gremvm ssh sw_vers
@@ -117,9 +109,7 @@ gremvm logs --follow
 gremvm uninstall
 ```
 
-These examples operate on `gremvm`. Substitute another installed command, such as `foovm`, to operate only on that VM.
-
-`stop` removes the run marker, unloads the user-domain service, and stops the VM. Automatic restart remains disabled until `start` is called. `restart`, `status`, `ssh`, and `logs` work from SSH.
+`stop` unloads the user-domain service and stops the VM. Automatic restart remains disabled until `start` is called. `restart`, `status`, `ssh`, and `logs` work from SSH.
 
 ## Guest Screen Sharing and the recovery console
 
@@ -139,7 +129,7 @@ gremvm screen-share
 
 Opening or closing Screen Sharing does not start, stop, suspend, or restart the VM. Use it for normal desktop access.
 
-Retrieve `gremvm`'s guest password from the host Keychain, replacing `<guest-user>` with the configured guest user:
+Retrieve the guest password from the host Keychain, replacing `<guest-user>` with the configured guest user:
 
 ```sh
 security find-generic-password \
@@ -148,13 +138,11 @@ security find-generic-password \
   -w
 ```
 
-For another command, the VM name appears in the service, for example `io.gremvm.tart.foovm.gui-password`. Guest passwords remain independent even when VMs use the same guest username.
-
 The password is used for the guest account and its login Keychain. The configured user logs in automatically after boot; the password is still required to authenticate a Screen Sharing connection. GremVM does not support password rotation after VM creation because the host and guest copies must remain synchronized.
 
-The VM command's `console` subcommand is the recovery path for guest boot, networking, or Screen Sharing failures. It opens Tart's local console on the host and must be invoked from that user's unlocked, on-console graphical session. It returns a clear error from SSH, a locked session, or another Background session. GremVM uses [Tart's suspendable mode](https://tart.run/blog/2023/09/20/tart-200-and-community-updates/) to save the running VM, resume the same session in the console, save it again when the console closes, and restore background supervision when it was previously enabled. It prevents idle display and system sleep while the console is open because macOS needs the unlocked graphical session to encrypt the saved state. Do not manually lock or log out of the host until the handoff completes.
+`console` is the recovery path for guest boot, networking, or Screen Sharing failures. It opens Tart's local console on the host and must be invoked from that user's unlocked, on-console graphical session. It returns a clear error from SSH, a locked session, or another Background session. GremVM uses [Tart's suspendable mode](https://tart.run/blog/2023/09/20/tart-200-and-community-updates/) to save the running VM, resume the same session in the console, save it again when the console closes, and restore background supervision when it was previously enabled. It prevents idle display and system sleep while the console is open because macOS needs the unlocked graphical session to encrypt the saved state. Do not manually lock or log out of the host until the handoff completes.
 
-An already running guest does not reboot during a successful handoff; a stopped VM has no live state to preserve and cold-boots. If Tart cannot produce a verified saved state, GremVM leaves automatic background restart disabled rather than silently cold-booting the guest. Inspect the error and run that VM command's `start` subcommand when a cold boot is acceptable.
+An already running guest does not reboot during a successful handoff; a stopped VM has no live state to preserve and cold-boots. If Tart cannot produce a verified saved state, GremVM leaves automatic background restart disabled rather than silently cold-booting the guest. Inspect the error and run `gremvm start` when a cold boot is acceptable.
 
 Security note: initial VM setup disables the macOS application firewall in the guest. Any enabled service bound to a non-loopback interface is directly reachable from the LAN, subject only to network-level filtering or client isolation. Automatic login requires guest FileVault to remain off and stores a reversible login secret in the guest's `/etc/kcpassword` file.
 
@@ -162,7 +150,7 @@ The `ssh` command uses the dedicated private key stored on the host. To connect 
 
 ## Tailscale
 
-Tailscale access is optional and runs directly inside the guest. GremVM uses Tailscale's open-source, CLI-only macOS daemon: there is no guest application, menu-bar item, system-extension approval, or dependency on a graphical login. The existing bridged LAN connection remains unchanged. The examples below use `gremvm`; replace it with `foovm` or another VM command as needed.
+Tailscale access is optional and runs directly inside the guest. GremVM uses Tailscale's open-source, CLI-only macOS daemon: there is no guest application, menu-bar item, system-extension approval, or dependency on a graphical login. The existing bridged LAN connection remains unchanged.
 
 With the VM running, install or upgrade the pinned guest daemon and join a tailnet:
 
@@ -199,7 +187,7 @@ CLI-only Tailscale does not update itself. GremVM ships a version pinned by `fla
 
 ## Storage
 
-Omitting `--storage` leaves `TART_HOME` unset, so Tart uses its normal location under `~/.tart`. Multiple VMs can share a Tart home because their command names are also unique Tart VM names. When `--storage` is present, its value is the exact Tart home: for example, `--storage /Volumes/Work/gremvm` stores VM data under `/Volumes/Work/gremvm/vms`.
+Omitting `--storage` leaves `TART_HOME` unset, so Tart uses its normal location under `~/.tart`. When `--storage` is present, its value is the exact Tart home: for example, `--storage /Volumes/Work/gremvm` stores VM data under `/Volumes/Work/gremvm/vms`.
 
 `--storage` accepts one thing: an existing absolute directory. These are all valid when the directories already exist and are writable:
 
@@ -221,7 +209,7 @@ Tart's raw disk image is sparse: `--disk-gb` sets its virtual capacity, while ph
 
 ## Removal
 
-`foovm uninstall` removes only `foovm`'s service definition, runtime link, and `~/.local/bin/foovm`; other VMs are untouched. It preserves `foovm`'s configuration, SSH keys, Keychain credentials, logs, and VM data in the selected storage location. Reinstall it with `nix run .#gremvm -- install foovm` and the same options.
+`gremvm uninstall` removes the service definition, runtime link, and `~/.local/bin/gremvm`. It preserves the configuration, SSH key, Keychain credentials, logs, and VM data in the selected storage location. Reinstall with `nix run . -- install` and the same options.
 
 ## Development
 
@@ -232,3 +220,5 @@ cargo clippy --all-targets --locked -- -D warnings
 cargo test --locked
 nix flake check
 ```
+
+To run multiple VMs, add a name when installing—for example, `nix run . -- install foovm` creates an independent VM managed with `foovm start`, `foovm status`, and the same remaining subcommands.

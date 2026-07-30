@@ -122,15 +122,9 @@
       };
     in
     {
-      packages.${system} = {
-        default = gremvm;
-        inherit gremvm;
-      };
+      packages.${system}.default = gremvm;
 
-      apps.${system} = {
-        default = gremvmApp;
-        gremvm = gremvmApp;
-      };
+      apps.${system}.default = gremvmApp;
 
       devShells.${system}.default = pkgs.mkShell {
         packages = [

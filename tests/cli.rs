@@ -555,7 +555,7 @@ fn command_names_select_isolated_vms() {
         .arg("status")
         .assert()
         .success()
-        .stdout(predicate::str::contains("state: starting\n"))
+        .stdout(predicate::str::contains("state: stopped\n"))
         .stdout(predicate::str::contains("name: foovm\n"))
         .stdout(predicate::str::contains("cpu: 4\n"))
         .stdout(predicate::str::contains("disk-gb: 96\n"));
