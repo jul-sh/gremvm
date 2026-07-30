@@ -151,6 +151,18 @@ struct VolumeStorage {
 }
 
 #[derive(Deserialize)]
+struct CryptoUsers {
+    #[serde(rename = "Users")]
+    users: Vec<CryptoUser>,
+}
+
+#[derive(Deserialize)]
+struct CryptoUser {
+    #[serde(rename = "APFSCryptoUserUUID")]
+    uuid: String,
+}
+
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StoredConfig {
     vm_name: String,
@@ -866,15 +878,16 @@ impl App {
             return self.store_keychain_password(
                 &self.config.guest_user,
                 &self.paths.password_service,
-                &password,
+                password.as_bytes(),
             );
         }
         let mut random = [0_u8; 24];
         getrandom::fill(&mut random)?;
+        let password = hex::encode(random);
         self.store_keychain_password(
             &self.config.guest_user,
             &self.paths.password_service,
-            &hex::encode(random),
+            password.as_bytes(),
         )
     }
 
@@ -914,7 +927,7 @@ impl App {
         Ok(None)
     }
 
-    fn store_keychain_password(&self, account: &str, service: &str, password: &str) -> Result<()> {
+    fn store_keychain_password(&self, account: &str, service: &str, password: &[u8]) -> Result<()> {
         let mut security = Command::new("/usr/bin/security")
             .arg("-i")
             .stdin(Stdio::piped())
@@ -933,7 +946,7 @@ impl App {
                 .take()
                 .context("security stdin is unavailable")?,
             "add-generic-password -a {account} -s {service} -U -X {} \"{keychain}\"",
-            hex::encode(password.as_bytes()),
+            hex::encode(password),
         )?;
         check_output(
             &security.wait_with_output()?,
@@ -1283,17 +1296,20 @@ impl App {
             }
             (VolumeKind::Encrypted, StorageAccess::Interactive, locked) => {
                 self.ensure_keychain(KeychainMode::Current)?;
-                let stored = self.keychain_password(uuid, VOLUME_PASSWORD_SERVICE)?;
-                let password = match stored {
-                    Some(password) if self.volume_password_valid(uuid, &password)? => password,
-                    _ => {
+                let password = match self.stored_volume_password(uuid)? {
+                    Some(password) => password,
+                    None => {
                         let password =
                             prompt_password(&format!("password for encrypted volume {name}: "))?;
                         ensure!(
                             self.volume_password_valid(uuid, password.as_bytes())?,
                             "incorrect password for encrypted volume {name}"
                         );
-                        self.store_keychain_password(uuid, VOLUME_PASSWORD_SERVICE, &password)?;
+                        self.store_keychain_password(
+                            uuid,
+                            VOLUME_PASSWORD_SERVICE,
+                            password.as_bytes(),
+                        )?;
                         password.into_bytes()
                     }
                 };
@@ -1375,12 +1391,48 @@ impl App {
         Ok(())
     }
 
+    fn stored_volume_password(&self, uuid: &str) -> Result<Option<Vec<u8>>> {
+        if let Some(password) = self.keychain_password(uuid, VOLUME_PASSWORD_SERVICE)?
+            && self.volume_password_valid(uuid, &password)?
+        {
+            return Ok(Some(password));
+        }
+        let Some(password) = self.keychain_password(uuid, uuid)? else {
+            return Ok(None);
+        };
+        if !self.volume_password_valid(uuid, &password)? {
+            return Ok(None);
+        }
+        self.store_keychain_password(uuid, VOLUME_PASSWORD_SERVICE, &password)?;
+        Ok(Some(password))
+    }
+
     fn volume_password_valid(&self, uuid: &str, password: &[u8]) -> Result<bool> {
-        let output = self.volume_password_command(
-            password,
-            &["apfs", "unlockVolume", uuid, "-stdinpassphrase", "-verify"],
-        )?;
-        Ok(output.status.success())
+        let output = Command::new("/usr/sbin/diskutil")
+            .args(["apfs", "listCryptoUsers", "-plist", uuid])
+            .output()
+            .context("cannot list encrypted volume users")?;
+        check_output(&output, "list encrypted volume users")?;
+        let users: CryptoUsers = plist::from_bytes(&output.stdout)
+            .context("diskutil returned malformed crypto-user information")?;
+        for user in users.users {
+            let output = self.volume_password_command(
+                password,
+                &[
+                    "apfs",
+                    "unlockVolume",
+                    uuid,
+                    "-user",
+                    &user.uuid,
+                    "-stdinpassphrase",
+                    "-verify",
+                ],
+            )?;
+            if output.status.success() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn run_volume_password(

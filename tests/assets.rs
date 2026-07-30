@@ -88,3 +88,27 @@ fn tailscale_upload_is_verified_before_root_executes_it() {
     assert!(driver.contains("/usr/bin/shasum -a 256 \\\"$stage\\\""));
     assert!(!driver.contains(".gremvm-tailscaled install-system-daemon"));
 }
+
+#[test]
+fn encrypted_volume_reuses_the_native_keychain_credential() {
+    let driver = include_str!("../src/lib.rs");
+    let stored_password = driver
+        .split_once("    fn stored_volume_password")
+        .unwrap()
+        .1
+        .split_once("    fn volume_password_valid")
+        .unwrap()
+        .0;
+
+    assert!(stored_password.contains("keychain_password(uuid, VOLUME_PASSWORD_SERVICE)"));
+    assert!(stored_password.contains("keychain_password(uuid, uuid)"));
+    assert!(
+        stored_password
+            .contains("store_keychain_password(uuid, VOLUME_PASSWORD_SERVICE, &password)")
+    );
+    let compact: String = driver.split_whitespace().collect();
+    assert!(compact.contains("\"listCryptoUsers\",\"-plist\",uuid"));
+    assert_eq!(compact.matches("\"-user\",&user.uuid,").count(), 1);
+    assert_eq!(driver.matches("\"-stdinpassphrase\",").count(), 2);
+    assert!(!driver.contains("-passphrase"));
+}
