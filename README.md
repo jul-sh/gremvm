@@ -36,6 +36,8 @@ nix run . -- install gremvm \
 
 This creates the VM and persistent `gremvm` command. The name and options are saved for the VM. Omit `--ask-password` to generate the initial guest password, and omit `--storage` to use Tart's default location under `~/.tart`. The password is stored in the host login Keychain rather than in the configuration file or command line.
 
+To run multiple VMs, install another name—for example, `nix run . -- install foovm`; that VM is then managed with `foovm start`, `foovm status`, and the other commands.
+
 Each VM stores its own settings: `gremvm` under `~/Library/Application Support/GremVM/config`, and other names under `~/Library/Application Support/GremVM/instances/<name>/config`. Hardware, guest user, storage, and password are fixed for that VM after creation; a new name can use different settings. Editing the files directly is unsupported.
 
 On the first run, the Nix installer configures the tooling and service, downloads the pinned image, and creates the VM. It leaves the VM stopped; run `gremvm start` when you want to start it. Creation can take several minutes. If it is interrupted, rerun the same command and GremVM will safely retry the incomplete installation.
@@ -113,8 +115,6 @@ Omitting `--storage` leaves `TART_HOME` unset, so Tart uses its normal location 
 ## Removal
 
 `gremvm uninstall` stops and deletes the VM, then removes the service definition, runtime link, and `~/.local/bin/gremvm`. It preserves the configuration, SSH key, Keychain credentials, and logs. Reinstall with `nix run . -- install gremvm` and the same options.
-
-To run multiple VMs, install another name—for example, `nix run . -- install foovm`; that VM is then managed with `foovm start`, `foovm status`, and the other commands.
 
 ## Development
 
