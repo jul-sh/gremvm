@@ -15,7 +15,16 @@ fn command_alias(directory: &Path, name: &str) -> PathBuf {
 
 #[test]
 fn help_describes_the_public_interface() {
-    cargo_bin_cmd!("gremvm")
+    cargo_bin_cmd!("gremvm-install")
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Usage: nix run . -- <COMMAND>"))
+        .stdout(predicate::str::contains("\n  install"))
+        .stdout(predicate::str::contains("\n  start").not())
+        .stdout(predicate::str::contains("\n  status").not());
+
+    cargo_bin_cmd!("gremvm-install")
         .arg("install")
         .arg("--help")
         .assert()
@@ -49,9 +58,6 @@ fn help_describes_the_public_interface() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "install       Install or update GremVM and create the VM if needed",
-        ))
-        .stdout(predicate::str::contains(
             "The guest always uses bridged networking on en0.",
         ))
         .stdout(predicate::str::contains(
@@ -63,17 +69,27 @@ fn help_describes_the_public_interface() {
         .stdout(predicate::str::contains(
             "tailscale     Manage CLI-only Tailscale inside the guest",
         ))
+        .stdout(predicate::str::contains("\n  install").not())
         .stdout(predicate::str::contains("\n  provision").not())
         .stdout(predicate::str::contains("\n  gui").not())
         .stdout(predicate::str::contains("internal-run").not())
         .stdout(predicate::str::contains("internal-keychain").not());
+
+    cargo_bin_cmd!("gremvm")
+        .arg("install")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "unrecognized subcommand 'install'",
+        ));
 
     let aliases = tempfile::tempdir().unwrap();
     Command::new(command_alias(aliases.path(), "foovm"))
         .arg("--help")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Usage: foovm <COMMAND>"));
+        .stdout(predicate::str::contains("Usage: foovm <COMMAND>"))
+        .stdout(predicate::str::contains("\n  install").not());
 
     cargo_bin_cmd!("gremvm")
         .arg("provision")
@@ -98,37 +114,37 @@ fn help_describes_the_public_interface() {
 
 #[test]
 fn install_rejects_invalid_settings() {
-    cargo_bin_cmd!("gremvm")
+    cargo_bin_cmd!("gremvm-install")
         .arg("install")
         .assert()
         .failure()
         .stderr(predicate::str::contains("<NAME>"));
-    cargo_bin_cmd!("gremvm")
+    cargo_bin_cmd!("gremvm-install")
         .args(["install", "../escape"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("name must be"));
-    cargo_bin_cmd!("gremvm")
+    cargo_bin_cmd!("gremvm-install")
         .args(["install", "gremvm", "--vm-name", "foovm"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("unexpected argument '--vm-name'"));
-    cargo_bin_cmd!("gremvm")
+    cargo_bin_cmd!("gremvm-install")
         .args(["install", "gremvm", "--disk-gb", "49"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("49 is not in 50.."));
-    cargo_bin_cmd!("gremvm")
+    cargo_bin_cmd!("gremvm-install")
         .args(["install", "gremvm", "--guest-user", "Admin"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("guest user must be"));
-    cargo_bin_cmd!("gremvm")
+    cargo_bin_cmd!("gremvm-install")
         .args(["install", "gremvm", "--guest-user", "root"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("reserved account"));
-    cargo_bin_cmd!("gremvm")
+    cargo_bin_cmd!("gremvm-install")
         .args(["install", "gremvm", "--storage", "relative/path"])
         .assert()
         .failure()
@@ -138,7 +154,7 @@ fn install_rejects_invalid_settings() {
 
     let home = tempfile::tempdir().unwrap();
     let missing = home.path().join("missing");
-    cargo_bin_cmd!("gremvm")
+    cargo_bin_cmd!("gremvm-install")
         .args(["install", "gremvm", "--storage"])
         .arg(&missing)
         .assert()
@@ -161,7 +177,7 @@ fn install_accepts_large_disks_and_explicit_storage() {
         .unwrap();
     assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
 
-    cargo_bin_cmd!("gremvm")
+    cargo_bin_cmd!("gremvm-install")
         .env("HOME", home.path())
         .args([
             "install",
@@ -206,7 +222,7 @@ fn management_commands_are_serialized() {
         .unwrap();
     assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
 
-    cargo_bin_cmd!("gremvm")
+    cargo_bin_cmd!("gremvm-install")
         .env("HOME", home.path())
         .args(["install", "gremvm"])
         .assert()
@@ -234,7 +250,7 @@ fn named_install_uses_its_own_management_lock() {
         .unwrap();
     assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
 
-    Command::new(&foovm)
+    cargo_bin_cmd!("gremvm-install")
         .env("HOME", home.path())
         .args(["install", "foovm"])
         .assert()
@@ -245,18 +261,12 @@ fn named_install_uses_its_own_management_lock() {
 
     Command::new(foovm)
         .env("HOME", home.path())
-        .args(["install", "barvm"])
+        .arg("install")
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "install name 'barvm' does not match command 'foovm'",
+            "unrecognized subcommand 'install'",
         ));
-    assert!(
-        !home
-            .path()
-            .join("Library/Application Support/GremVM/instances/barvm")
-            .exists()
-    );
 }
 
 #[test]
@@ -473,7 +483,7 @@ fn default_storage_uses_tarts_normal_home() {
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "VM does not exist; rerun 'gremvm install gremvm'",
+            "VM does not exist; rerun 'nix run github:jul-sh/gremvm -- install gremvm'",
         ));
 }
 

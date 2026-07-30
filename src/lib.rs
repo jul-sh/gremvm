@@ -30,14 +30,24 @@ const BRIDGE: &str = "en0";
 
 #[derive(Parser)]
 #[command(
+    bin_name = "nix run . --",
+    version,
+    about = "Install a persistent Tart macOS VM",
+    arg_required_else_help = true
+)]
+enum InstallerAction {
+    /// Install or update GremVM and create the VM if needed.
+    Install(InstallOptions),
+}
+
+#[derive(Parser)]
+#[command(
     version,
     about = "Manage a persistent Tart macOS VM",
     arg_required_else_help = true,
     after_help = "The guest always uses bridged networking on en0."
 )]
 enum Action {
-    /// Install or update GremVM and create the VM if needed.
-    Install(InstallOptions),
     /// Show VM state.
     Status,
     /// Start the VM and wait for SSH.
@@ -400,7 +410,10 @@ impl Paths {
     }
 
     fn install_hint(&self) -> String {
-        format!("{} install {}", self.command_name(), self.command_name())
+        format!(
+            "nix run github:jul-sh/gremvm -- install {}",
+            self.command_name()
+        )
     }
 
     fn autoload_agent(&self) -> PathBuf {
@@ -591,26 +604,11 @@ pub fn command_name() -> String {
 
 pub fn run() -> Result<()> {
     let command = Action::parse();
-    let invoked = command_name();
-    valid_name(&invoked).map_err(anyhow::Error::msg)?;
-    let invoked = Identity::from_name(invoked);
-    let name = match (&command, &invoked) {
-        (Action::Install(options), Identity::Gremvm) => options.name.clone(),
-        (Action::Install(options), Identity::Named(name)) => {
-            ensure!(
-                options.name == *name,
-                "install name '{}' does not match command '{}'",
-                options.name,
-                name
-            );
-            options.name.clone()
-        }
-        _ => invoked.command_name().to_owned(),
-    };
+    let name = command_name();
+    valid_name(&name).map_err(anyhow::Error::msg)?;
     let paths = Paths::discover(name)?;
     let _lock = match &command {
-        Action::Install(_)
-        | Action::Start
+        Action::Start
         | Action::Stop
         | Action::Restart
         | Action::Console
@@ -621,10 +619,6 @@ pub fn run() -> Result<()> {
         _ => None,
     };
     match command {
-        Action::Install(options) => {
-            let (config, password) = options.resolve(&paths)?;
-            App { paths, config }.install(password)
-        }
         Action::InternalKeychain { mode } => internal_keychain(&paths, mode),
         Action::Status if !is_executable(&paths.bin("tart")) => {
             println!("state: not-installed");
@@ -645,10 +639,17 @@ pub fn run() -> Result<()> {
     }
 }
 
+pub fn run_installer() -> Result<()> {
+    let InstallerAction::Install(options) = InstallerAction::parse();
+    let paths = Paths::discover(options.name.clone())?;
+    let _lock = management_lock(&paths)?;
+    let (config, password) = options.resolve(&paths)?;
+    App { paths, config }.install(password)
+}
+
 impl App {
     fn dispatch(&self, command: Action) -> Result<()> {
         match command {
-            Action::Install(_) => unreachable!(),
             Action::Status => self.status(),
             Action::Start => self.start(),
             Action::Stop => self.stop(),
