@@ -19,6 +19,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::NamedTempFile;
 
+mod install_state;
+
+use install_state::{VmInstallation, classify};
+
 const LABEL: &str = "io.gremvm.tart";
 const KEYCHAIN_HELPER_LABEL: &str = "io.gremvm.keychain";
 const PASSWORD_SERVICE: &str = "io.gremvm.tart.gui-password";
@@ -34,10 +38,8 @@ const BRIDGE: &str = "en0";
     after_help = "The guest always uses bridged networking on en0."
 )]
 enum Action {
-    /// Install the pinned runtime and background service.
+    /// Install or update GremVM and create the VM if needed.
     Install(InstallOptions),
-    /// Create and start the VM.
-    Provision,
     /// Show VM state.
     Status,
     /// Start the VM and wait for SSH.
@@ -180,6 +182,13 @@ enum PasswordChoice {
     Prompt,
 }
 
+#[derive(Clone, Copy)]
+enum InstallPlan {
+    Create,
+    UpdateEnabled,
+    UpdateDisabled,
+}
+
 impl InstallOptions {
     fn resolve(self, paths: &Paths) -> Result<(Config, PasswordChoice)> {
         let storage = match self.storage {
@@ -313,6 +322,7 @@ struct Paths {
     logs: PathBuf,
     runtime: PathBuf,
     run_marker: PathBuf,
+    installing: PathBuf,
     provisioned: PathBuf,
     launch_agent: PathBuf,
     command_link: PathBuf,
@@ -336,6 +346,7 @@ impl Paths {
                 .join(format!("{LABEL}.plist")),
             runtime: root.join("runtime"),
             run_marker: state.join("run"),
+            installing: state.join("installing"),
             provisioned: state.join("provisioned"),
             ssh_key: config_dir.join("id_ed25519"),
             guest_tailscale: root.join("runtime/libexec/gremvm/tailscaled"),
@@ -526,7 +537,6 @@ pub fn run() -> Result<()> {
     let paths = Paths::discover()?;
     let _lock = match &command {
         Action::Install(_)
-        | Action::Provision
         | Action::Start
         | Action::Stop
         | Action::Restart
@@ -565,7 +575,6 @@ impl App {
     fn dispatch(&self, command: Action) -> Result<()> {
         match command {
             Action::Install(_) => unreachable!(),
-            Action::Provision => self.provision(),
             Action::Status => self.status(),
             Action::Start => self.start(),
             Action::Stop => self.stop(),
@@ -589,33 +598,77 @@ impl App {
         self.validate_host()?;
         self.install_runtime()?;
         self.install_command()?;
-        let exists = self.vm_exists()?;
-        if exists {
-            self.verify_config()?;
-        }
-        let policy = if exists {
-            CredentialPolicy::Existing
-        } else {
-            CredentialPolicy::CreateIfMissing
+        let plan = self.install_plan()?;
+        let policy = match plan {
+            InstallPlan::Create => CredentialPolicy::CreateIfMissing,
+            InstallPlan::UpdateEnabled | InstallPlan::UpdateDisabled => CredentialPolicy::Existing,
         };
         self.install_ssh_key(policy)?;
         self.prepare_guest_password(policy, password)?;
-        let restart = exists && self.paths.run_marker.exists();
-        if restart {
-            self.ensure_keychain(KeychainMode::BackgroundInteractive)?;
+        match plan {
+            InstallPlan::Create | InstallPlan::UpdateEnabled => {
+                self.ensure_keychain(KeychainMode::BackgroundInteractive)?;
+            }
+            InstallPlan::UpdateDisabled => {}
         }
         self.config.persist(&self.paths)?;
         self.install_service()?;
-        if restart {
-            self.start_service()?;
+        if let InstallPlan::Create = plan {
+            remove_if_present(&self.paths.provisioned)?;
+            touch(&self.paths.installing)?;
+            self.build_vm()?;
+            ensure!(
+                self.vm_exists()?,
+                "Packer completed without creating the VM"
+            );
+            self.verify_config()?;
+            touch(&self.paths.provisioned)?;
+            remove_if_present(&self.paths.installing)?;
         }
         println!("installed: {}", self.paths.command_link.display());
-        if exists {
-            println!("VM: {}", self.config.vm_name);
-        } else {
-            println!("next: gremvm provision");
+        match plan {
+            InstallPlan::Create | InstallPlan::UpdateEnabled => {
+                touch(&self.paths.run_marker)?;
+                self.start_service()?;
+                println!(
+                    "ready: {}@{}",
+                    self.config.guest_user,
+                    self.wait_for_ssh(300)?
+                );
+            }
+            InstallPlan::UpdateDisabled => {
+                println!("VM: {} (stopped)", self.config.vm_name);
+            }
         }
         Ok(())
+    }
+
+    fn install_plan(&self) -> Result<InstallPlan> {
+        match classify(
+            self.vm_exists()?,
+            self.paths.provisioned.exists(),
+            self.paths.installing.exists(),
+        ) {
+            VmInstallation::Absent => Ok(InstallPlan::Create),
+            VmInstallation::Partial => {
+                println!("removing incomplete VM before retrying...");
+                self.delete_partial_vm()?;
+                Ok(InstallPlan::Create)
+            }
+            VmInstallation::Ready => {
+                self.verify_config()?;
+                remove_if_present(&self.paths.installing)?;
+                if self.paths.run_marker.exists() {
+                    Ok(InstallPlan::UpdateEnabled)
+                } else {
+                    Ok(InstallPlan::UpdateDisabled)
+                }
+            }
+            VmInstallation::Unmanaged => bail!(
+                "a VM named '{}' exists but was not created by GremVM; rename or remove it before rerunning 'gremvm install'",
+                self.config.vm_name
+            ),
+        }
     }
 
     fn validate_host(&self) -> Result<()> {
@@ -740,17 +793,6 @@ impl App {
         choice: PasswordChoice,
     ) -> Result<()> {
         self.ensure_keychain(KeychainMode::Current)?;
-        if matches!(policy, CredentialPolicy::Existing) && matches!(choice, PasswordChoice::Prompt)
-        {
-            bail!("the guest password cannot be changed after provisioning");
-        }
-        if matches!(policy, CredentialPolicy::CreateIfMissing)
-            && matches!(choice, PasswordChoice::Prompt)
-        {
-            let password = prompt_guest_password()?;
-            self.store_keychain_password(&self.config.guest_user, PASSWORD_SERVICE, &password)?;
-            return Ok(());
-        }
         if self
             .keychain_password(&self.config.guest_user, PASSWORD_SERVICE)?
             .is_some()
@@ -758,10 +800,19 @@ impl App {
             self.guest_password()?;
             return Ok(());
         }
-        ensure!(
-            matches!(policy, CredentialPolicy::CreateIfMissing),
-            "the guest password is missing from Keychain and cannot be regenerated for an existing VM"
-        );
+        if let CredentialPolicy::Existing = policy {
+            bail!(
+                "the guest password is missing from Keychain and cannot be regenerated for an existing VM"
+            );
+        }
+        if let PasswordChoice::Prompt = choice {
+            let password = prompt_guest_password()?;
+            return self.store_keychain_password(
+                &self.config.guest_user,
+                PASSWORD_SERVICE,
+                &password,
+            );
+        }
         let mut random = [0_u8; 24];
         getrandom::fill(&mut random)?;
         self.store_keychain_password(
@@ -929,36 +980,6 @@ impl App {
         self.launchctl(&["kickstart", &service_target()], "start the service")
     }
 
-    fn provision(&self) -> Result<()> {
-        self.ensure_keychain(KeychainMode::Current)?;
-        self.ensure_keychain(KeychainMode::BackgroundInteractive)?;
-        self.ensure_storage(StorageAccess::Interactive)?;
-        self.validate_host()?;
-        if self.vm_exists()? {
-            ensure!(
-                self.paths.provisioned.exists(),
-                "VM provisioning is incomplete"
-            );
-            self.verify_config()?;
-        } else {
-            self.build_vm()?;
-            ensure!(
-                self.vm_exists()?,
-                "Packer completed without creating the VM"
-            );
-            self.verify_config()?;
-            touch(&self.paths.provisioned)?;
-        }
-        touch(&self.paths.run_marker)?;
-        self.start_service()?;
-        println!(
-            "ready: {}@{}",
-            self.config.guest_user,
-            self.wait_for_ssh(300)?
-        );
-        Ok(())
-    }
-
     fn build_vm(&self) -> Result<()> {
         let public_key = fs::read_to_string(self.paths.ssh_key.with_extension("pub"))?;
         let password = self.guest_password()?;
@@ -967,6 +988,23 @@ impl App {
             self.config.vm_name
         );
         self.packer(public_key.trim(), &password)
+    }
+
+    fn delete_partial_vm(&self) -> Result<()> {
+        match self.vm_info()?.state {
+            VmState::Running | VmState::Suspended => success(
+                self.tart()?
+                    .args(["stop", &self.config.vm_name, "--timeout", "30"]),
+                "stop the incomplete VM",
+            )?,
+            VmState::Stopped => {}
+        }
+        success(
+            self.tart()?.args(["delete", &self.config.vm_name]),
+            "delete the incomplete VM",
+        )?;
+        ensure!(!self.vm_exists()?, "Tart did not delete the incomplete VM");
+        Ok(())
     }
 
     fn packer(&self, key: &str, password: &str) -> Result<()> {
@@ -1434,11 +1472,11 @@ impl App {
         self.ensure_storage(StorageAccess::Interactive)?;
         ensure!(
             self.vm_exists()?,
-            "VM does not exist; run 'gremvm provision'"
+            "VM does not exist; rerun 'gremvm install'"
         );
         ensure!(
             self.paths.provisioned.exists(),
-            "VM provisioning is incomplete"
+            "VM installation is incomplete; rerun 'gremvm install'"
         );
         self.verify_config()?;
         validate_bridge()?;
@@ -1661,11 +1699,11 @@ impl App {
         self.ensure_storage(StorageAccess::Background)?;
         ensure!(
             self.vm_exists()?,
-            "VM does not exist; run 'gremvm provision'"
+            "VM does not exist; rerun 'gremvm install'"
         );
         ensure!(
             self.paths.provisioned.exists(),
-            "VM provisioning is incomplete"
+            "VM installation is incomplete; rerun 'gremvm install'"
         );
         match self.vm_info()?.state {
             VmState::Running => {}
@@ -1832,7 +1870,11 @@ impl App {
         self.ensure_storage(StorageAccess::Background)?;
         ensure!(
             self.vm_exists()?,
-            "VM does not exist; run 'gremvm provision'"
+            "VM does not exist; rerun 'gremvm install'"
+        );
+        ensure!(
+            self.paths.provisioned.exists(),
+            "VM installation is incomplete; rerun 'gremvm install'"
         );
         match self.vm_info()?.state {
             VmState::Running => {}
@@ -1938,7 +1980,7 @@ impl App {
 
     fn status(&self) -> Result<()> {
         if !self.vm_exists()? {
-            println!("state: not-provisioned");
+            println!("state: incomplete");
             return Ok(());
         }
         let vm = self.vm_info()?;

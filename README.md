@@ -29,7 +29,7 @@ GremVM approximates this with [Tart](https://tart.run/): a persistent macOS Taho
 - An existing writable directory when using `--storage`; encrypted non-system volumes must use APFS
 - An active `en0` interface connected to the LAN
 - At least the configured CPU count and more memory than the guest allocation
-- Enough host storage for provisioning, VM disk growth, and a suspend image that can approach the configured guest memory
+- Enough host storage for initial VM creation, disk growth, and a suspend image that can approach the configured guest memory
 
 On macOS 15 and later, Tart requires the host account's login Keychain to be unlocked when a VM starts. See [Tart's headless-machine guidance](https://tart.run/faq/#headless-machines).
 
@@ -39,12 +39,13 @@ From the repository root:
 
 ```sh
 nix run .#gremvm -- install
-gremvm provision
 ```
 
-These commands use the defaults below. To change them, pass the desired flags to the first `install`; that choice is saved for this VM. `install` writes the configuration, creates credentials, registers the Nix bundle as a garbage-collection root, and installs the per-user service definition. `provision` downloads the pinned image, creates the VM, starts it, and waits for SSH. Provisioning can take several minutes and requires an uninterrupted network connection.
+This uses the defaults below. To change them, pass the desired flags to `install`; that choice is saved for this VM. On the first run, `install` configures the tooling and service, downloads the pinned image, creates the VM, starts it, and waits for SSH. This can take several minutes. If VM creation is interrupted, rerun the same command and GremVM will safely retry its incomplete installation.
 
-On macOS 15 and later, Packer may trigger a one-time Local Network privacy prompt. For provisioning without a graphical session, apply [Tart's documented noninteractive workaround](https://tart.run/faq/#avoiding-the-local-network-permission-pop-up) before running `provision`.
+Rerunning the same `install` command updates and verifies the managed tooling without rebuilding the VM. It preserves whether an existing VM was running or intentionally stopped.
+
+On macOS 15 and later, Packer may trigger a one-time Local Network privacy prompt. For the first installation without a graphical session, apply [Tart's documented noninteractive workaround](https://tart.run/faq/#avoiding-the-local-network-permission-pop-up) before running `install`.
 
 Installation creates the persistent user command `~/.local/bin/gremvm`, which points to the managed runtime under `~/Library/Application Support/GremVM`.
 
@@ -91,11 +92,12 @@ nix run .#gremvm -- install \
 
 Without `--ask-password`, GremVM generates the initial guest password. Either way, it stores the password in the host login Keychain rather than in the configuration file or command line.
 
-The first install saves settings in `~/Library/Application Support/GremVM/config/config.json`. The VM name, hardware, guest user, storage path, and guest password are provisioning-time choices: subsequent installs must use the same settings, and GremVM does not reconfigure an existing VM or rotate its password. Editing the configuration file is unsupported.
+The first install saves settings in `~/Library/Application Support/GremVM/config/config.json`. The VM name, hardware, guest user, storage path, and guest password are creation-time choices: subsequent installs must use the same settings, and GremVM does not reconfigure an existing VM or rotate its password. Editing the configuration file is unsupported.
 
 ## Commands
 
 ```sh
+gremvm install [options]
 gremvm status
 gremvm ssh
 gremvm ssh sw_vers
@@ -139,13 +141,13 @@ security find-generic-password \
   -w
 ```
 
-The password is used for the guest account and its login Keychain. The configured user logs in automatically after boot; the password is still required to authenticate a Screen Sharing connection. GremVM does not support password rotation after provisioning because the host and guest copies must remain synchronized.
+The password is used for the guest account and its login Keychain. The configured user logs in automatically after boot; the password is still required to authenticate a Screen Sharing connection. GremVM does not support password rotation after VM creation because the host and guest copies must remain synchronized.
 
 `gremvm console` is the recovery path for guest boot, networking, or Screen Sharing failures. It opens Tart's local console on the host and must be invoked from that user's unlocked, on-console graphical session. It returns a clear error from SSH, a locked session, or another Background session. GremVM uses [Tart's suspendable mode](https://tart.run/blog/2023/09/20/tart-200-and-community-updates/) to save the running VM, resume the same session in the console, save it again when the console closes, and restore background supervision when it was previously enabled. It prevents idle display and system sleep while the console is open because macOS needs the unlocked graphical session to encrypt the saved state. Do not manually lock or log out of the host until the handoff completes.
 
 An already running guest does not reboot during a successful handoff; a stopped VM has no live state to preserve and cold-boots. If Tart cannot produce a verified saved state, GremVM leaves automatic background restart disabled rather than silently cold-booting the guest. Inspect the error and run `gremvm start` when a cold boot is acceptable.
 
-Security note: provisioning disables the macOS application firewall in the guest. Any enabled service bound to a non-loopback interface is directly reachable from the LAN, subject only to network-level filtering or client isolation. Automatic login requires guest FileVault to remain off and stores a reversible login secret in the guest's `/etc/kcpassword` file.
+Security note: initial VM setup disables the macOS application firewall in the guest. Any enabled service bound to a non-loopback interface is directly reachable from the LAN, subject only to network-level filtering or client isolation. Automatic login requires guest FileVault to remain off and stores a reversible login secret in the guest's `/etc/kcpassword` file.
 
 The `ssh` command uses the dedicated private key stored on the host. To connect over SSH from another computer, add that computer's public key to `/Users/<guest-user>/.ssh/authorized_keys` in the guest.
 

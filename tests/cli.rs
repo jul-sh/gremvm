@@ -40,6 +40,9 @@ fn help_describes_the_public_interface() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
+            "install       Install or update GremVM and create the VM if needed",
+        ))
+        .stdout(predicate::str::contains(
             "The guest always uses bridged networking on en0.",
         ))
         .stdout(predicate::str::contains(
@@ -51,9 +54,18 @@ fn help_describes_the_public_interface() {
         .stdout(predicate::str::contains(
             "tailscale     Manage CLI-only Tailscale inside the guest",
         ))
+        .stdout(predicate::str::contains("\n  provision").not())
         .stdout(predicate::str::contains("\n  gui").not())
         .stdout(predicate::str::contains("internal-run").not())
         .stdout(predicate::str::contains("internal-keychain").not());
+
+    cargo_bin_cmd!("gremvm")
+        .arg("provision")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "unrecognized subcommand 'provision'",
+        ));
 
     cargo_bin_cmd!("gremvm")
         .args(["tailscale", "--help"])
@@ -383,7 +395,16 @@ fn default_storage_uses_tarts_normal_home() {
         .arg("status")
         .assert()
         .success()
-        .stdout("state: not-provisioned\n");
+        .stdout("state: incomplete\n");
+
+    cargo_bin_cmd!("gremvm")
+        .env("HOME", home.path())
+        .arg("screen-share")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "VM does not exist; rerun 'gremvm install'",
+        ));
 }
 
 #[test]
@@ -426,7 +447,7 @@ fn explicit_storage_uses_the_exact_directory() {
         .arg("status")
         .assert()
         .success()
-        .stdout("state: not-provisioned\n");
+        .stdout("state: incomplete\n");
 }
 
 #[test]
