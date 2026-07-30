@@ -97,7 +97,8 @@
           ln -s ${tart}/Applications/tart.app "$out/Applications/tart.app"
           mkdir -p "$out/share/gremvm"
           install -m 0644 ${./packer/gremvm.pkr.hcl} "$out/share/gremvm/gremvm.pkr.hcl"
-          install -m 0644 ${./packer/auto-login.pl} "$out/share/gremvm/auto-login.pl"
+          install -m 0755 ${./packer/configure-guest.sh} "$out/share/gremvm/configure-guest.sh"
+          install -m 0755 ${./packer/password.expect} "$out/share/gremvm/password.expect"
           mkdir -p "$out/libexec/gremvm" "$out/share/gremvm/licenses"
           install -m 0755 ${pkgs.tailscale}/bin/.tailscaled-wrapped \
             "$out/libexec/gremvm/tailscaled"
@@ -185,7 +186,8 @@
           /usr/bin/codesign --verify --deep --strict ${gremvm}/Applications/tart.app
           test -x ${gremvm}/bin/packer
           test -f ${gremvm}/share/gremvm/gremvm.pkr.hcl
-          test -f ${gremvm}/share/gremvm/auto-login.pl
+          test -x ${gremvm}/share/gremvm/configure-guest.sh
+          test -x ${gremvm}/share/gremvm/password.expect
           test -x ${gremvm}/libexec/gremvm/tailscaled
           test -f ${gremvm}/share/gremvm/licenses/tailscale.txt
           test "$(${gremvm}/libexec/gremvm/tailscaled --version | head -n 1)" = ${pkgs.tailscale.version}
@@ -194,7 +196,8 @@
           HOME="$TMPDIR/home" ${gremvm}/bin/gremvm --help >/dev/null
           mkdir -p "$TMPDIR/home" "$TMPDIR/packer"
           cp ${gremvm}/share/gremvm/gremvm.pkr.hcl "$TMPDIR/packer/gremvm.pkr.hcl"
-          cp ${gremvm}/share/gremvm/auto-login.pl "$TMPDIR/packer/auto-login.pl"
+          cp ${gremvm}/share/gremvm/configure-guest.sh "$TMPDIR/packer/configure-guest.sh"
+          cp ${gremvm}/share/gremvm/password.expect "$TMPDIR/packer/password.expect"
           cd "$TMPDIR/packer"
           export HOME="$TMPDIR/home"
           export PACKER_NO_COLOR=1
@@ -204,6 +207,7 @@
             PKR_VAR_cpu_count=6 \
             PKR_VAR_memory_gb=24 \
             PKR_VAR_disk_size_gb=192 \
+            PKR_VAR_guest_user=admin \
             PKR_VAR_ssh_public_key="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest" \
             PKR_VAR_guest_password=0123456789abcdef0123456789abcdef0123456789abcdef \
             ${gremvm}/bin/packer validate gremvm.pkr.hcl

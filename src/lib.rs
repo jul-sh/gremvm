@@ -22,6 +22,7 @@ use tempfile::NamedTempFile;
 const LABEL: &str = "io.gremvm.tart";
 const KEYCHAIN_HELPER_LABEL: &str = "io.gremvm.keychain";
 const PASSWORD_SERVICE: &str = "io.gremvm.tart.gui-password";
+const VOLUME_PASSWORD_SERVICE: &str = "io.gremvm.volume-password";
 const BRIDGE: &str = "en0";
 
 #[derive(Parser)]
@@ -45,7 +46,7 @@ enum Action {
     Stop,
     /// Stop and start the VM.
     Restart,
-    /// Connect as the admin guest user.
+    /// Connect as the configured guest user.
     Ssh {
         #[arg(num_args = 0.., trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<OsString>,
@@ -95,67 +96,189 @@ struct InstallOptions {
     #[arg(long, default_value_t = 24, value_parser = clap::value_parser!(u32).range(4..=256))]
     memory_gb: u32,
     /// Virtual disk size in decimal GB.
-    #[arg(long, default_value_t = 192, value_parser = clap::value_parser!(u32).range(50..=350))]
+    #[arg(long, default_value_t = 192, value_parser = clap::value_parser!(u32).range(50..=10_000))]
     disk_gb: u32,
-    /// Encrypted APFS volume containing the VM.
-    #[arg(long, value_parser = valid_name)]
-    volume_name: Option<String>,
+    /// Guest account short name.
+    #[arg(long, default_value = "admin", value_parser = valid_user)]
+    guest_user: String,
+    /// Prompt for the initial guest password instead of generating one.
+    #[arg(long)]
+    ask_password: bool,
+    /// Existing absolute directory containing the VM.
+    #[arg(long, value_name = "DIRECTORY", value_parser = existing_directory)]
+    storage: Option<PathBuf>,
 }
 
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 struct Config {
     vm_name: String,
+    guest_user: String,
     cpu_count: u32,
     memory_gb: u32,
     disk_gb: u32,
     storage: Storage,
 }
 
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 enum Storage {
     Default,
-    Volume { name: String, uuid: String },
+    Directory {
+        path: PathBuf,
+    },
+    PlainVolume(VolumeStorage),
+    #[serde(rename = "encrypted-volume")]
+    EncryptedVolume(VolumeStorage),
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VolumeStorage {
+    path: PathBuf,
+    mount_point: PathBuf,
+    name: String,
+    uuid: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredConfig {
+    vm_name: String,
+    #[serde(default = "default_guest_user")]
+    guest_user: String,
+    cpu_count: u32,
+    memory_gb: u32,
+    disk_gb: u32,
+    storage: StoredStorage,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+enum StoredStorage {
+    Default,
+    Directory {
+        path: PathBuf,
+    },
+    PlainVolume(VolumeStorage),
+    EncryptedVolume(VolumeStorage),
+    #[serde(rename = "volume")]
+    LegacyVolume {
+        name: String,
+        uuid: String,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VolumeKind {
+    Plain,
+    Encrypted,
+}
+
+#[derive(Clone, Copy)]
+enum PasswordChoice {
+    Generate,
+    Prompt,
 }
 
 impl InstallOptions {
-    fn resolve(self) -> Result<Config> {
-        let storage = match self.volume_name {
-            Some(name) => {
-                let volume = volume_info(&name)?;
-                ensure!(
-                    volume.volume_name == name,
-                    "diskutil resolved the wrong volume"
-                );
-                Storage::Volume {
-                    name,
-                    uuid: volume.volume_uuid,
+    fn resolve(self, paths: &Paths) -> Result<(Config, PasswordChoice)> {
+        let storage = match self.storage {
+            None => Storage::Default,
+            Some(path) => {
+                let volume = volume_for_path(&path)?;
+                if volume.volume_uuid == volume_for_path(&paths.home)?.volume_uuid {
+                    Storage::Directory { path }
+                } else {
+                    let encrypted = volume.file_vault;
+                    if encrypted {
+                        ensure!(
+                            volume.filesystem_type == "apfs",
+                            "encrypted VM storage volume must be APFS"
+                        );
+                    }
+                    let mount_point = volume
+                        .mount_point
+                        .context("storage volume is not mounted")?;
+                    let name = volume.volume_name;
+                    let uuid = volume.volume_uuid;
+                    validate_volume_reference(&path, &mount_point, &name, &uuid)?;
+                    let volume = VolumeStorage {
+                        path,
+                        mount_point,
+                        name,
+                        uuid,
+                    };
+                    if encrypted {
+                        Storage::EncryptedVolume(volume)
+                    } else {
+                        Storage::PlainVolume(volume)
+                    }
                 }
             }
-            None => Storage::Default,
         };
-        Ok(Config {
-            vm_name: self.vm_name,
-            cpu_count: self.cpu_count,
-            memory_gb: self.memory_gb,
-            disk_gb: self.disk_gb,
-            storage,
-        })
+        Ok((
+            Config {
+                vm_name: self.vm_name,
+                guest_user: self.guest_user,
+                cpu_count: self.cpu_count,
+                memory_gb: self.memory_gb,
+                disk_gb: self.disk_gb,
+                storage,
+            },
+            if self.ask_password {
+                PasswordChoice::Prompt
+            } else {
+                PasswordChoice::Generate
+            },
+        ))
     }
 }
 
 impl Config {
     fn load(paths: &Paths) -> Result<Self> {
-        let config: Self = serde_json::from_reader(fs::File::open(&paths.config_file)?)?;
+        let stored: StoredConfig = serde_json::from_reader(fs::File::open(&paths.config_file)?)?;
+        let storage = match stored.storage {
+            StoredStorage::Default => Storage::Default,
+            StoredStorage::Directory { path } => Storage::Directory { path },
+            StoredStorage::PlainVolume(volume) => Storage::PlainVolume(volume),
+            StoredStorage::EncryptedVolume(volume) => Storage::EncryptedVolume(volume),
+            StoredStorage::LegacyVolume { name, uuid } => {
+                let path = Path::new("/Volumes").join(&name);
+                Storage::EncryptedVolume(VolumeStorage {
+                    mount_point: path.clone(),
+                    path,
+                    name,
+                    uuid,
+                })
+            }
+        };
+        let config = Self {
+            vm_name: stored.vm_name,
+            guest_user: stored.guest_user,
+            cpu_count: stored.cpu_count,
+            memory_gb: stored.memory_gb,
+            disk_gb: stored.disk_gb,
+            storage,
+        };
         valid_name(&config.vm_name).map_err(anyhow::Error::msg)?;
-        if let Storage::Volume { name, uuid } = &config.storage {
-            valid_name(name).map_err(anyhow::Error::msg)?;
-            valid_name(uuid).map_err(anyhow::Error::msg)?;
+        valid_user(&config.guest_user).map_err(anyhow::Error::msg)?;
+        match &config.storage {
+            Storage::Default => {}
+            Storage::Directory { path } => {
+                ensure!(path.is_absolute(), "storage directory must be absolute")
+            }
+            Storage::PlainVolume(volume) | Storage::EncryptedVolume(volume) => {
+                validate_volume_reference(
+                    &volume.path,
+                    &volume.mount_point,
+                    &volume.name,
+                    &volume.uuid,
+                )?;
+            }
         }
         ensure!((1..=64).contains(&config.cpu_count), "invalid CPU count");
         ensure!((4..=256).contains(&config.memory_gb), "invalid memory size");
-        ensure!((50..=350).contains(&config.disk_gb), "invalid disk size");
+        ensure!((50..=10_000).contains(&config.disk_gb), "invalid disk size");
         Ok(config)
     }
 
@@ -266,12 +389,16 @@ enum ConsoleSource {
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct VolumeInfo {
+    #[serde(default)]
     file_vault: bool,
     filesystem_type: String,
+    #[serde(default)]
+    locked: bool,
     mount_point: Option<PathBuf>,
     volume_name: String,
     #[serde(rename = "VolumeUUID")]
     volume_uuid: String,
+    #[serde(default)]
     writable_volume: bool,
 }
 
@@ -342,6 +469,17 @@ enum KeychainMode {
     Background,
 }
 
+#[derive(Clone, Copy)]
+enum StorageAccess {
+    Interactive,
+    Background,
+}
+
+enum VolumeUnlock {
+    Unnecessary,
+    Password(Vec<u8>),
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 enum KeychainHelperMode {
     Check,
@@ -400,11 +538,10 @@ pub fn run() -> Result<()> {
         _ => None,
     };
     match command {
-        Action::Install(options) => App {
-            paths,
-            config: options.resolve()?,
+        Action::Install(options) => {
+            let (config, password) = options.resolve(&paths)?;
+            App { paths, config }.install(password)
         }
-        .install(),
         Action::InternalKeychain { mode } => internal_keychain(&paths, mode),
         Action::Status if !is_executable(&paths.bin("tart")) => {
             println!("state: not-installed");
@@ -444,11 +581,11 @@ impl App {
         }
     }
 
-    fn install(&self) -> Result<()> {
+    fn install(&self, password: PasswordChoice) -> Result<()> {
         self.clear_keychain_helper()?;
         self.config.check_existing(&self.paths)?;
         self.ensure_keychain(KeychainMode::Current)?;
-        self.ensure_storage()?;
+        self.ensure_storage(StorageAccess::Interactive)?;
         self.validate_host()?;
         self.install_runtime()?;
         self.install_command()?;
@@ -462,7 +599,7 @@ impl App {
             CredentialPolicy::CreateIfMissing
         };
         self.install_ssh_key(policy)?;
-        self.guest_password(policy)?;
+        self.prepare_guest_password(policy, password)?;
         let restart = exists && self.paths.run_marker.exists();
         if restart {
             self.ensure_keychain(KeychainMode::BackgroundInteractive)?;
@@ -514,7 +651,8 @@ impl App {
             "bin/tart",
             "bin/packer",
             "share/gremvm/gremvm.pkr.hcl",
-            "share/gremvm/auto-login.pl",
+            "share/gremvm/configure-guest.sh",
+            "share/gremvm/password.expect",
             "libexec/gremvm/tailscaled",
         ] {
             ensure!(
@@ -596,56 +734,104 @@ impl App {
         Ok(())
     }
 
-    fn guest_password(&self, policy: CredentialPolicy) -> Result<String> {
+    fn prepare_guest_password(
+        &self,
+        policy: CredentialPolicy,
+        choice: PasswordChoice,
+    ) -> Result<()> {
         self.ensure_keychain(KeychainMode::Current)?;
+        if matches!(policy, CredentialPolicy::Existing) && matches!(choice, PasswordChoice::Prompt)
+        {
+            bail!("the guest password cannot be changed after provisioning");
+        }
+        if matches!(policy, CredentialPolicy::CreateIfMissing)
+            && matches!(choice, PasswordChoice::Prompt)
+        {
+            let password = prompt_guest_password()?;
+            self.store_keychain_password(&self.config.guest_user, PASSWORD_SERVICE, &password)?;
+            return Ok(());
+        }
+        if self
+            .keychain_password(&self.config.guest_user, PASSWORD_SERVICE)?
+            .is_some()
+        {
+            self.guest_password()?;
+            return Ok(());
+        }
+        ensure!(
+            matches!(policy, CredentialPolicy::CreateIfMissing),
+            "the guest password is missing from Keychain and cannot be regenerated for an existing VM"
+        );
+        let mut random = [0_u8; 24];
+        getrandom::fill(&mut random)?;
+        self.store_keychain_password(
+            &self.config.guest_user,
+            PASSWORD_SERVICE,
+            &hex::encode(random),
+        )
+    }
+
+    fn guest_password(&self) -> Result<String> {
+        self.ensure_keychain(KeychainMode::Current)?;
+        let bytes = self
+            .keychain_password(&self.config.guest_user, PASSWORD_SERVICE)?
+            .context("the guest password is missing from Keychain")?;
+        let password =
+            String::from_utf8(bytes).context("the stored guest password is not UTF-8")?;
+        validate_guest_password(&password).map_err(anyhow::Error::msg)?;
+        Ok(password)
+    }
+
+    fn keychain_password(&self, account: &str, service: &str) -> Result<Option<Vec<u8>>> {
         let output = Command::new("/usr/bin/security")
-            .args([
-                "find-generic-password",
-                "-a",
-                "admin",
-                "-s",
-                PASSWORD_SERVICE,
-                "-w",
-            ])
-            .output()?;
+            .args(["find-generic-password", "-a", account, "-s", service, "-w"])
+            .arg(login_keychain(&self.paths))
+            .output()
+            .context("cannot read a password from Keychain")?;
         if output.status.success() {
-            let password = String::from_utf8(output.stdout)?.trim().to_owned();
-            ensure!(!password.is_empty(), "the stored guest password is empty");
-            return Ok(password);
+            let mut password = output.stdout;
+            if password.ends_with(b"\n") {
+                password.pop();
+                if password.ends_with(b"\r") {
+                    password.pop();
+                }
+            }
+            ensure!(!password.is_empty(), "the stored password is empty");
+            return Ok(Some(password));
         }
         ensure!(
             output.status.code() == Some(44),
-            "cannot read the guest password from Keychain: {}",
+            "cannot read a password from Keychain: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         );
-        match policy {
-            CredentialPolicy::Existing => bail!(
-                "the guest password is missing from Keychain and cannot be regenerated for an existing VM"
-            ),
-            CredentialPolicy::CreateIfMissing => {}
-        }
-        let mut random = [0_u8; 24];
-        getrandom::fill(&mut random)?;
-        let password = hex::encode(random);
+        Ok(None)
+    }
+
+    fn store_keychain_password(&self, account: &str, service: &str, password: &str) -> Result<()> {
         let mut security = Command::new("/usr/bin/security")
             .arg("-i")
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
-            .context("cannot store the guest password in Keychain")?;
+            .context("cannot store a password in Keychain")?;
+        let keychain = login_keychain(&self.paths)
+            .to_str()
+            .context("login Keychain path is not UTF-8")?
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"");
         writeln!(
             security
                 .stdin
                 .take()
                 .context("security stdin is unavailable")?,
-            "add-generic-password -a admin -s {PASSWORD_SERVICE} -U -w {password}"
+            "add-generic-password -a {account} -s {service} -U -X {} \"{keychain}\"",
+            hex::encode(password.as_bytes()),
         )?;
         check_output(
             &security.wait_with_output()?,
-            "store the guest password in Keychain",
-        )?;
-        Ok(password)
+            "store a password in Keychain",
+        )
     }
 
     fn install_service(&self) -> Result<()> {
@@ -746,7 +932,7 @@ impl App {
     fn provision(&self) -> Result<()> {
         self.ensure_keychain(KeychainMode::Current)?;
         self.ensure_keychain(KeychainMode::BackgroundInteractive)?;
-        self.ensure_storage()?;
+        self.ensure_storage(StorageAccess::Interactive)?;
         self.validate_host()?;
         if self.vm_exists()? {
             ensure!(
@@ -765,13 +951,17 @@ impl App {
         }
         touch(&self.paths.run_marker)?;
         self.start_service()?;
-        println!("ready: admin@{}", self.wait_for_ssh(300)?);
+        println!(
+            "ready: {}@{}",
+            self.config.guest_user,
+            self.wait_for_ssh(300)?
+        );
         Ok(())
     }
 
     fn build_vm(&self) -> Result<()> {
         let public_key = fs::read_to_string(self.paths.ssh_key.with_extension("pub"))?;
-        let password = self.guest_password(CredentialPolicy::Existing)?;
+        let password = self.guest_password()?;
         println!(
             "creating {} from the pinned macOS image...",
             self.config.vm_name
@@ -803,6 +993,7 @@ impl App {
             .env("PACKER_NO_COLOR", "1")
             .env("CHECKPOINT_DISABLE", "1")
             .env("PKR_VAR_vm_name", &self.config.vm_name)
+            .env("PKR_VAR_guest_user", &self.config.guest_user)
             .env("PKR_VAR_cpu_count", self.config.cpu_count.to_string())
             .env("PKR_VAR_memory_gb", self.config.memory_gb.to_string())
             .env("PKR_VAR_disk_size_gb", self.config.disk_gb.to_string())
@@ -958,65 +1149,199 @@ impl App {
     fn tart_home(&self) -> PathBuf {
         match &self.config.storage {
             Storage::Default => self.paths.home.join(".tart"),
-            Storage::Volume { name, .. } => Path::new("/Volumes").join(name),
+            Storage::Directory { path } => path.clone(),
+            Storage::PlainVolume(volume) | Storage::EncryptedVolume(volume) => volume.path.clone(),
         }
     }
 
-    fn ensure_volume(&self, name: &str, uuid: &str) -> Result<()> {
-        let mount_point = Path::new("/Volumes").join(name);
+    fn ensure_directory(&self, path: &Path) -> Result<()> {
+        ensure!(
+            canonical_directory(path)? == path,
+            "VM storage directory changed identity: {}",
+            path.display()
+        );
+        Ok(())
+    }
+
+    fn ensure_volume(
+        &self,
+        storage: &VolumeStorage,
+        kind: VolumeKind,
+        access: StorageAccess,
+    ) -> Result<()> {
+        let VolumeStorage {
+            path,
+            mount_point,
+            name,
+            uuid,
+        } = storage;
+        validate_volume_reference(path, mount_point, name, uuid)?;
         let mut volume = volume_info(uuid)?;
-        ensure!(
-            volume.volume_name == name && volume.volume_uuid == uuid,
-            "diskutil resolved the wrong VM storage volume"
-        );
-        ensure!(
-            volume.filesystem_type == "apfs" && volume.file_vault,
-            "VM storage volume must be encrypted APFS"
-        );
+        validate_volume(&volume, name, uuid, kind)?;
+        let unlock = match (kind, access, volume.locked) {
+            (VolumeKind::Plain, _, _)
+            | (VolumeKind::Encrypted, StorageAccess::Background, false) => {
+                VolumeUnlock::Unnecessary
+            }
+            (VolumeKind::Encrypted, StorageAccess::Interactive, locked) => {
+                self.ensure_keychain(KeychainMode::Current)?;
+                let stored = self.keychain_password(uuid, VOLUME_PASSWORD_SERVICE)?;
+                let password = match stored {
+                    Some(password) if self.volume_password_valid(uuid, &password)? => password,
+                    _ => {
+                        let password =
+                            prompt_password(&format!("password for encrypted volume {name}: "))?;
+                        ensure!(
+                            self.volume_password_valid(uuid, password.as_bytes())?,
+                            "incorrect password for encrypted volume {name}"
+                        );
+                        self.store_keychain_password(uuid, VOLUME_PASSWORD_SERVICE, &password)?;
+                        password.into_bytes()
+                    }
+                };
+                if locked {
+                    VolumeUnlock::Password(password)
+                } else {
+                    VolumeUnlock::Unnecessary
+                }
+            }
+            (VolumeKind::Encrypted, StorageAccess::Background, true) => {
+                self.ensure_keychain(KeychainMode::Background)?;
+                VolumeUnlock::Password(
+                    self.keychain_password(uuid, VOLUME_PASSWORD_SERVICE)?
+                        .context(
+                            "encrypted volume credential is missing; run 'gremvm start' interactively",
+                        )?,
+                )
+            }
+        };
+        match unlock {
+            VolumeUnlock::Unnecessary => {}
+            VolumeUnlock::Password(password) => {
+                self.run_volume_password(
+                    uuid,
+                    &password,
+                    &["apfs", "unlockVolume", uuid, "-stdinpassphrase", "-nomount"],
+                    "unlock the VM storage volume",
+                )?;
+                volume = volume_info(uuid)?;
+                validate_volume(&volume, name, uuid, kind)?;
+            }
+        }
         if volume
             .mount_point
             .as_ref()
             .is_none_or(|path| path.as_os_str().is_empty())
         {
-            ensure!(
-                !mount_point.exists(),
-                "VM storage mount path already exists: {}",
-                mount_point.display()
-            );
+            let standard_mount = Path::new("/Volumes").join(name);
+            let mut mount = Command::new("/usr/sbin/diskutil");
+            mount.arg("mount");
+            if mount_point.as_path() == standard_mount {
+                ensure!(
+                    !mount_point.exists(),
+                    "VM storage mount path already exists: {}",
+                    mount_point.display()
+                );
+            } else {
+                ensure!(
+                    mount_point.is_dir(),
+                    "custom VM storage mount point is missing: {}",
+                    mount_point.display()
+                );
+                ensure!(
+                    fs::read_dir(mount_point)?.next().is_none(),
+                    "custom VM storage mount point is not empty: {}",
+                    mount_point.display()
+                );
+                mount.arg("-mountPoint").arg(mount_point);
+            }
             success(
-                Command::new("/usr/sbin/diskutil")
-                    .args(["mount", uuid])
-                    .stdin(Stdio::null()),
+                mount.arg(uuid).stdin(Stdio::null()),
                 "mount the VM storage volume",
             )?;
             volume = volume_info(uuid)?;
+            validate_volume(&volume, name, uuid, kind)?;
         }
         ensure!(
-            volume.volume_name == name
-                && volume.volume_uuid == uuid
-                && volume.mount_point.as_deref() == Some(mount_point.as_path()),
+            volume.volume_name == name.as_str()
+                && volume.volume_uuid == uuid.as_str()
+                && volume.mount_point.as_deref() == Some(mount_point),
             "VM storage volume {} is not mounted at {}",
             name,
             mount_point.display()
         );
         ensure!(volume.writable_volume, "VM storage volume is read-only");
-        NamedTempFile::new_in(&mount_point)
-            .and_then(NamedTempFile::close)
-            .context("VM storage volume is not writable by this user")?;
+        self.ensure_directory(path)
+            .context("VM storage directory is unavailable after mounting its volume")?;
         Ok(())
     }
 
-    fn volume_mounted(&self, name: &str, uuid: &str) -> Result<bool> {
-        let volume = volume_info(uuid)?;
-        Ok(volume.volume_name == name
-            && volume.volume_uuid == uuid
-            && volume.mount_point.as_deref() == Some(Path::new("/Volumes").join(name).as_path()))
+    fn volume_password_valid(&self, uuid: &str, password: &[u8]) -> Result<bool> {
+        let output = self.volume_password_command(
+            password,
+            &["apfs", "unlockVolume", uuid, "-stdinpassphrase", "-verify"],
+        )?;
+        Ok(output.status.success())
     }
 
-    fn ensure_storage(&self) -> Result<()> {
+    fn run_volume_password(
+        &self,
+        uuid: &str,
+        password: &[u8],
+        arguments: &[&str],
+        description: &str,
+    ) -> Result<()> {
+        check_output(
+            &self.volume_password_command(password, arguments)?,
+            description,
+        )
+        .with_context(|| format!("encrypted volume {uuid}"))
+    }
+
+    fn volume_password_command(&self, password: &[u8], arguments: &[&str]) -> Result<Output> {
+        let mut command = Command::new("/usr/sbin/diskutil")
+            .args(arguments)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("cannot run diskutil")?;
+        command
+            .stdin
+            .take()
+            .context("diskutil stdin is unavailable")?
+            .write_all(password)?;
+        command
+            .wait_with_output()
+            .context("cannot wait for diskutil")
+    }
+
+    fn volume_mounted(&self, storage: &VolumeStorage, kind: VolumeKind) -> Result<bool> {
+        let VolumeStorage {
+            mount_point,
+            name,
+            uuid,
+            ..
+        } = storage;
+        let volume = volume_info(uuid)?;
+        Ok(volume.volume_name == name.as_str()
+            && volume.volume_uuid == uuid.as_str()
+            && match kind {
+                VolumeKind::Plain => !volume.file_vault,
+                VolumeKind::Encrypted => volume.filesystem_type == "apfs" && volume.file_vault,
+            }
+            && !volume.locked
+            && volume.mount_point.as_deref() == Some(mount_point))
+    }
+
+    fn ensure_storage(&self, access: StorageAccess) -> Result<()> {
         match &self.config.storage {
             Storage::Default => Ok(()),
-            Storage::Volume { name, uuid } => self.ensure_volume(name, uuid),
+            Storage::Directory { path } => self.ensure_directory(path),
+            Storage::PlainVolume(volume) => self.ensure_volume(volume, VolumeKind::Plain, access),
+            Storage::EncryptedVolume(volume) => {
+                self.ensure_volume(volume, VolumeKind::Encrypted, access)
+            }
         }
     }
 
@@ -1026,9 +1351,19 @@ impl App {
                 command.env_remove("TART_HOME");
                 Ok(())
             }
-            Storage::Volume { name, uuid } => {
-                self.ensure_volume(name, uuid)?;
-                command.env("TART_HOME", Path::new("/Volumes").join(name));
+            Storage::Directory { path } => {
+                self.ensure_directory(path)?;
+                command.env("TART_HOME", path);
+                Ok(())
+            }
+            Storage::PlainVolume(volume) => {
+                self.ensure_volume(volume, VolumeKind::Plain, StorageAccess::Background)?;
+                command.env("TART_HOME", &volume.path);
+                Ok(())
+            }
+            Storage::EncryptedVolume(volume) => {
+                self.ensure_volume(volume, VolumeKind::Encrypted, StorageAccess::Background)?;
+                command.env("TART_HOME", &volume.path);
                 Ok(())
             }
         }
@@ -1096,7 +1431,7 @@ impl App {
         );
         self.ensure_keychain(KeychainMode::Current)?;
         self.ensure_keychain(KeychainMode::BackgroundInteractive)?;
-        self.ensure_storage()?;
+        self.ensure_storage(StorageAccess::Interactive)?;
         ensure!(
             self.vm_exists()?,
             "VM does not exist; run 'gremvm provision'"
@@ -1118,7 +1453,11 @@ impl App {
     fn start_ready(&self) -> Result<()> {
         touch(&self.paths.run_marker)?;
         self.start_service()?;
-        println!("running: admin@{}", self.wait_for_ssh(300)?);
+        println!(
+            "running: {}@{}",
+            self.config.guest_user,
+            self.wait_for_ssh(300)?
+        );
         Ok(())
     }
 
@@ -1143,7 +1482,13 @@ impl App {
     fn stop_tart(&self) -> Result<()> {
         let storage_mounted = match &self.config.storage {
             Storage::Default => true,
-            Storage::Volume { name, uuid } => self.volume_mounted(name, uuid)?,
+            Storage::Directory { path } => path.is_dir(),
+            Storage::PlainVolume(volume) => {
+                volume.path.is_dir() && self.volume_mounted(volume, VolumeKind::Plain)?
+            }
+            Storage::EncryptedVolume(volume) => {
+                volume.path.is_dir() && self.volume_mounted(volume, VolumeKind::Encrypted)?
+            }
         };
         let manageable =
             is_executable(&self.paths.bin("tart")) && storage_mounted && self.vm_exists()?;
@@ -1301,7 +1646,7 @@ impl App {
                 "UserKnownHostsFile={}",
                 self.paths.config_dir.join("known_hosts").display()
             ))
-            .arg(format!("admin@{ip}"));
+            .arg(format!("{}@{ip}", self.config.guest_user));
         command
     }
 
@@ -1313,7 +1658,7 @@ impl App {
     }
 
     fn tailscale(&self, action: TailscaleAction) -> Result<()> {
-        self.ensure_storage()?;
+        self.ensure_storage(StorageAccess::Background)?;
         ensure!(
             self.vm_exists()?,
             "VM does not exist; run 'gremvm provision'"
@@ -1341,12 +1686,11 @@ impl App {
             self.paths.guest_tailscale.is_file(),
             "the packaged Tailscale binary is missing"
         );
+        let upload = format!("/Users/{}/.gremvm-tailscaled", self.config.guest_user);
         let output = self
             .ssh_command(ip)
-            .arg(concat!(
-                "umask 077; ",
-                "/bin/cat > /Users/admin/.gremvm-tailscaled && ",
-                "/bin/chmod 0700 /Users/admin/.gremvm-tailscaled"
+            .arg(format!(
+                "umask 077; /bin/cat > {upload} && /bin/chmod 0700 {upload}"
             ))
             .stdin(Stdio::from(fs::File::open(&self.paths.guest_tailscale)?))
             .output()
@@ -1367,7 +1711,7 @@ impl App {
             checksum.len() == 64 && checksum.bytes().all(|byte| byte.is_ascii_hexdigit()),
             "shasum returned an invalid digest"
         );
-        let password = self.guest_password(CredentialPolicy::Existing)?;
+        let password = self.guest_password()?;
         let mut install = self
             .ssh_command(ip)
             .arg(format!(
@@ -1375,7 +1719,7 @@ impl App {
                     "/usr/bin/sudo -S -k -p '' /bin/sh -c '",
                     "stage=$(/usr/bin/mktemp /private/var/tmp/gremvm-tailscaled.XXXXXX) ",
                     "|| exit 1; ",
-                    "/bin/cat /Users/admin/.gremvm-tailscaled > \"$stage\" && ",
+                    "/bin/cat {} > \"$stage\" && ",
                     "/bin/chmod 0700 \"$stage\" && ",
                     "test \"$(/usr/bin/shasum -a 256 \"$stage\" | ",
                     "/usr/bin/cut -d \" \" -f 1)\" = {} && ",
@@ -1388,9 +1732,9 @@ impl App {
                     "/bin/launchctl load ",
                     "/Library/LaunchDaemons/com.tailscale.tailscaled.plist; ",
                     "result=$?; /bin/rm -f \"$stage\"; exit $result",
-                    "'; result=$?; /bin/rm -f /Users/admin/.gremvm-tailscaled; exit $result"
+                    "'; result=$?; /bin/rm -f {}; exit $result"
                 ),
-                checksum
+                upload, checksum, upload
             ))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1422,8 +1766,8 @@ impl App {
         let status = self
             .ssh_command(ip)
             .arg(format!(
-                "/usr/local/bin/tailscale up --accept-dns=false --hostname={} --operator=admin",
-                self.config.vm_name
+                "/usr/local/bin/tailscale up --accept-dns=false --hostname={} --operator={}",
+                self.config.vm_name, self.config.guest_user
             ))
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
@@ -1447,7 +1791,7 @@ impl App {
             TailscaleState::Connected { ip } => {
                 println!("tailscale: connected");
                 println!("tailscale-ip: {ip}");
-                println!("ssh: ssh admin@{ip}");
+                println!("ssh: ssh {}@{ip}", self.config.guest_user);
                 println!("screen-sharing: vnc://{ip}");
             }
         }
@@ -1485,7 +1829,7 @@ impl App {
     }
 
     fn screen_share(&self) -> Result<()> {
-        self.ensure_storage()?;
+        self.ensure_storage(StorageAccess::Background)?;
         ensure!(
             self.vm_exists()?,
             "VM does not exist; run 'gremvm provision'"
@@ -1502,7 +1846,7 @@ impl App {
             Command::new("/usr/bin/open").arg(format!("vnc://{ip}")),
             "open guest Screen Sharing",
         )?;
-        println!("screen sharing: admin@{ip}");
+        println!("screen sharing: {}@{ip}", self.config.guest_user);
         Ok(())
     }
 
@@ -1514,7 +1858,7 @@ impl App {
         if resume_background {
             self.ensure_keychain(KeychainMode::BackgroundInteractive)?;
         }
-        self.ensure_storage()?;
+        self.ensure_storage(StorageAccess::Interactive)?;
         ensure!(self.vm_exists()?, "VM does not exist");
         validate_bridge()?;
         if resume_background {
@@ -1583,7 +1927,11 @@ impl App {
             println!("console closed; restoring the background VM...");
             touch(&self.paths.run_marker)?;
             self.start_service()?;
-            println!("running: admin@{}", self.wait_for_ssh(300)?);
+            println!(
+                "running: {}@{}",
+                self.config.guest_user,
+                self.wait_for_ssh(300)?
+            );
         }
         Ok(())
     }
@@ -1657,7 +2005,7 @@ impl App {
             return Ok(());
         }
         self.ensure_keychain(KeychainMode::Background)?;
-        self.ensure_storage()?;
+        self.ensure_storage(StorageAccess::Background)?;
         if !self.vm_exists()? {
             return Ok(());
         }
@@ -1687,6 +2035,73 @@ fn valid_name(name: &str) -> std::result::Result<String, String> {
     valid
         .then(|| name.to_owned())
         .ok_or_else(|| "name must be 1-64 letters, numbers, dots, underscores, or hyphens and start with a letter or number".into())
+}
+
+fn default_guest_user() -> String {
+    "admin".into()
+}
+
+fn valid_user(name: &str) -> std::result::Result<String, String> {
+    let reserved = ["daemon", "guest", "nobody", "root"];
+    let valid = name.len() <= 32
+        && name
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_lowercase())
+        && name.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"_-".contains(&byte)
+        })
+        && !reserved.contains(&name);
+    valid
+        .then(|| name.to_owned())
+        .ok_or_else(|| {
+            "guest user must be 1-32 lowercase letters, numbers, underscores, or hyphens, start with a letter, and not be a reserved account".into()
+        })
+}
+
+fn existing_directory(value: &str) -> std::result::Result<PathBuf, String> {
+    canonical_directory(Path::new(value)).map_err(|error| error.to_string())
+}
+
+fn canonical_directory(path: &Path) -> Result<PathBuf> {
+    ensure!(path.is_absolute(), "storage directory must be absolute");
+    ensure!(
+        path.is_dir(),
+        "storage directory does not exist: {}",
+        path.display()
+    );
+    let canonical = path.canonicalize()?;
+    NamedTempFile::new_in(&canonical)
+        .and_then(NamedTempFile::close)
+        .with_context(|| format!("storage directory is not writable: {}", canonical.display()))?;
+    Ok(canonical)
+}
+
+fn prompt_password(prompt: &str) -> Result<String> {
+    let password = rpassword::prompt_password(prompt).context("cannot read hidden password")?;
+    ensure!(!password.is_empty(), "password must not be empty");
+    ensure!(
+        !password.chars().any(char::is_control),
+        "password must not contain control characters"
+    );
+    Ok(password)
+}
+
+fn prompt_guest_password() -> Result<String> {
+    let password = prompt_password("guest password: ")?;
+    validate_guest_password(&password).map_err(anyhow::Error::msg)?;
+    ensure!(
+        password == prompt_password("confirm guest password: ")?,
+        "guest passwords do not match"
+    );
+    Ok(password)
+}
+
+fn validate_guest_password(password: &str) -> std::result::Result<(), String> {
+    (8..=128)
+        .contains(&password.chars().count())
+        .then_some(())
+        .ok_or_else(|| "guest password must be 8-128 characters".into())
 }
 
 fn private_dir(path: &Path) -> Result<()> {
@@ -1801,6 +2216,75 @@ fn volume_info(selector: &str) -> Result<VolumeInfo> {
         .context("cannot inspect the VM storage volume")?;
     check_output(&output, "inspect the VM storage volume")?;
     plist::from_bytes(&output.stdout).context("diskutil returned malformed volume information")
+}
+
+fn volume_for_path(path: &Path) -> Result<VolumeInfo> {
+    let output = checked(
+        Command::new("/bin/df").arg("-P").arg(path),
+        "inspect the storage directory filesystem",
+    )?;
+    let device = output
+        .lines()
+        .nth(1)
+        .and_then(|line| line.split_whitespace().next())
+        .context("df returned malformed filesystem information")?;
+    volume_info(device)
+}
+
+fn validate_volume_reference(
+    path: &Path,
+    mount_point: &Path,
+    name: &str,
+    uuid: &str,
+) -> Result<()> {
+    ensure!(path.is_absolute(), "storage directory must be absolute");
+    ensure!(
+        mount_point.is_absolute() && mount_point != Path::new("/"),
+        "invalid VM storage mount point"
+    );
+    ensure!(
+        !name.is_empty()
+            && name != "."
+            && name != ".."
+            && !name.contains('/')
+            && !name.chars().any(char::is_control),
+        "invalid VM storage volume name"
+    );
+    ensure!(
+        uuid.len() == 36
+            && uuid.bytes().enumerate().all(|(index, byte)| {
+                if [8, 13, 18, 23].contains(&index) {
+                    byte == b'-'
+                } else {
+                    byte.is_ascii_hexdigit()
+                }
+            }),
+        "invalid VM storage volume UUID"
+    );
+    ensure!(
+        path == mount_point || path.starts_with(mount_point),
+        "VM storage directory is outside its recorded volume: {}",
+        path.display()
+    );
+    Ok(())
+}
+
+fn validate_volume(volume: &VolumeInfo, name: &str, uuid: &str, kind: VolumeKind) -> Result<()> {
+    ensure!(
+        volume.volume_name == name && volume.volume_uuid == uuid,
+        "diskutil resolved the wrong VM storage volume"
+    );
+    match kind {
+        VolumeKind::Plain => ensure!(
+            !volume.file_vault,
+            "VM storage volume unexpectedly became encrypted"
+        ),
+        VolumeKind::Encrypted => ensure!(
+            volume.filesystem_type == "apfs" && volume.file_vault,
+            "VM storage volume must remain encrypted APFS"
+        ),
+    }
+    Ok(())
 }
 
 fn success(command: &mut Command, description: &str) -> Result<()> {

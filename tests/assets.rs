@@ -1,10 +1,8 @@
-use std::io::Write;
-use std::process::{Command, Stdio};
-
 #[test]
 fn packer_template_pins_the_image_and_preserves_recovery() {
     let packer = include_str!("../packer/gremvm.pkr.hcl");
-    let auto_login = include_str!("../packer/auto-login.pl");
+    let configure_guest = include_str!("../packer/configure-guest.sh");
+    let password_helper = include_str!("../packer/password.expect");
     let image = packer
         .lines()
         .find(|line| line.trim_start().starts_with("vm_base_name"))
@@ -17,30 +15,23 @@ fn packer_template_pins_the_image_and_preserves_recovery() {
     assert!(packer.contains("recovery_partition = \"relocate\""));
     assert!(packer.contains("headless           = true"));
     assert!(packer.contains("display            = \"1512x982px\""));
-    assert!(packer.contains("systemsetup -setremotelogin on"));
-    assert!(packer.contains("PasswordAuthentication no"));
-    assert!(packer.contains("/usr/bin/perl /tmp/gremvm-auto-login.pl"));
-    assert!(packer.contains("autoLoginUser admin"));
-    assert!(auto_login.contains("<STDIN>"));
-    assert!(packer.contains("socketfilterfw --setglobalstate off"));
-}
-
-#[test]
-fn auto_login_encoder_reads_the_password_from_stdin() {
-    let mut child = Command::new("/usr/bin/perl")
-        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/packer/auto-login.pl"))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child.stdin.take().unwrap().write_all(b"admin").unwrap();
-    let output = child.wait_with_output().unwrap();
-
-    assert!(output.status.success());
-    assert_eq!(
-        output.stdout,
-        hex::decode("1ced3f4abcbcddeaa3b91f7d").unwrap()
-    );
+    assert!(packer.contains("ssh_username       = \"admin\""));
+    assert!(packer.contains("ssh_password       = \"admin\""));
+    assert!(packer.contains("\"GREMVM_GUEST_USER=${var.guest_user}\""));
+    assert!(packer.contains("\"GREMVM_GUEST_PASSWORD=${var.guest_password}\""));
+    assert!(packer.contains("use_env_var_file = true"));
+    assert!(configure_guest.contains("systemsetup -setremotelogin on"));
+    assert!(configure_guest.contains("PasswordAuthentication no"));
+    assert!(configure_guest.contains("home=/Users/$user"));
+    assert!(configure_guest.contains("$home/.skipbuddy"));
+    assert!(configure_guest.contains("autologin \"$user\""));
+    assert!(configure_guest.contains("[[ \"$user\" != admin ]]"));
+    assert!(configure_guest.contains("unset GREMVM_GUEST_PASSWORD"));
+    assert!(password_helper.contains("log_user 0"));
+    assert!(password_helper.contains("set password [read -nonewline stdin]"));
+    assert!(password_helper.contains("-autologin set -userName $user -password -"));
+    assert!(!password_helper.contains("-password $password"));
+    assert!(configure_guest.contains("socketfilterfw --setglobalstate off"));
 }
 
 #[test]
@@ -70,7 +61,9 @@ fn tailscale_upload_is_verified_before_root_executes_it() {
     let driver = include_str!("../src/lib.rs");
 
     assert!(driver.contains("umask 077; "));
-    assert!(driver.contains("/bin/chmod 0700 /Users/admin/.gremvm-tailscaled"));
+    assert!(driver.contains(
+        "let upload = format!(\"/Users/{}/.gremvm-tailscaled\", self.config.guest_user);"
+    ));
     assert!(driver.contains("/private/var/tmp/gremvm-tailscaled.XXXXXX"));
     assert!(driver.contains("/usr/bin/shasum -a 256 \\\"$stage\\\""));
     assert!(!driver.contains(".gremvm-tailscaled install-system-daemon"));
