@@ -22,42 +22,7 @@ It should have its own IP address. You should be able to SSH or Screen Share int
 
 ## Install
 
-From the repository root:
-
-```sh
-nix run . -- install gremvm
-```
-
-This creates the VM and persistent `gremvm` command. To change the defaults, pass the desired flags to `install`; those choices are saved for the VM.
-
-On the first run, `install` configures the tooling and service, downloads the pinned image, and creates the VM. It leaves the VM stopped; run `gremvm start` when you want to start it. Creation can take several minutes. If it is interrupted, rerun the same command and GremVM will safely retry the incomplete installation.
-
-Rerunning `install` updates and verifies the managed tooling without rebuilding the VM. It also leaves the VM stopped, so start it explicitly afterward.
-
-On macOS 15 and later, Packer may trigger a one-time Local Network privacy prompt. For the first installation without a graphical session, apply [Tart's documented noninteractive workaround](https://tart.run/faq/#avoiding-the-local-network-permission-pop-up) before running `install`.
-
-### Starting from SSH
-
-After a host reboot without a graphical login, SSH into the host and run:
-
-```sh
-gremvm start
-```
-
-## Configuration
-
-Configuration is accepted as flags to `install`:
-
-| Flag | Default | Accepted values |
-| --- | --- | --- |
-| `--cpu-count` | `6` | 1–64 |
-| `--memory-gb` | `24` GiB | 4–256 GiB |
-| `--disk-gb` | `192` GB | 50 GB or more |
-| `--guest-user` | `admin` | 1–32 lowercase letters, numbers, underscores, or hyphens; starts with a letter and is not a reserved macOS account |
-| `--ask-password` | Generated password | Prompt twice for the initial guest password with input hidden |
-| `--storage` | Tart default (`~/.tart`) | Existing, writable absolute directory |
-
-For example, assuming `/Volumes/BuildVM/gremvm` already exists:
+From the repository root, for example, assuming `/Volumes/BuildVM/gremvm` already exists:
 
 ```sh
 nix run . -- install gremvm \
@@ -69,14 +34,27 @@ nix run . -- install gremvm \
   --storage /Volumes/BuildVM/gremvm
 ```
 
-Without `--ask-password`, GremVM generates the initial guest password. Either way, it stores the password in the host login Keychain rather than in the configuration file or command line.
+This creates the VM and persistent `gremvm` command. The name and options are saved for the VM. Omit `--ask-password` to generate the initial guest password, and omit `--storage` to use Tart's default location under `~/.tart`. The password is stored in the host login Keychain rather than in the configuration file or command line.
 
 Settings are saved in `~/Library/Application Support/GremVM/config/config.json`. The hardware, guest user, storage path, and guest password are creation-time choices. Subsequent installs must use the same settings, and GremVM does not reconfigure an existing VM or rotate its password. Editing the configuration file is unsupported.
+
+On the first run, `install` configures the tooling and service, downloads the pinned image, and creates the VM. It leaves the VM stopped; run `gremvm start` when you want to start it. Creation can take several minutes. If it is interrupted, rerun the same command and GremVM will safely retry the incomplete installation.
+
+Rerunning the same `nix run` command updates and verifies the managed tooling without rebuilding the VM. It also leaves the VM stopped, so start it explicitly afterward.
+
+On macOS 15 and later, Packer may trigger a one-time Local Network privacy prompt. For the first installation without a graphical session, apply [Tart's documented noninteractive workaround](https://tart.run/faq/#avoiding-the-local-network-permission-pop-up) before running `install`.
+
+### Starting from SSH
+
+After a host reboot without a graphical login, SSH into the host and run:
+
+```sh
+gremvm start
+```
 
 ## Commands
 
 ```sh
-gremvm install <NAME> [options]
 gremvm status
 gremvm ssh
 gremvm ssh sw_vers
